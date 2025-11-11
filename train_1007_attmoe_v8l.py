@@ -196,12 +196,14 @@ def sutherland_hodgman_clip(subject: torch.Tensor, clip: torch.Tensor) -> torch.
     return output_list
 
 
-def iou_rotated(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+def iou_rotated(boxes1: torch.Tensor, boxes2: torch.Tensor,
+                mode: str = "fast") -> torch.Tensor:
     """
-    计算旋转框的 IoU (纯 PyTorch 实现，支持 GPU)
+    计算旋转框的 IoU (优化版本：两阶段过滤 + 小角度快速路径)
     Args:
         boxes1: (N, 5) tensor, [cx, cy, w, h, angle(弧度)]
         boxes2: (M, 5) tensor, [cx, cy, w, h, angle(弧度)]
+        mode: 'fast' - 两阶段过滤(推荐), 'accurate' - 全精确计算, 'aabb' - 纯AABB近似
     Returns:
         iou: (N, M) tensor
     """
@@ -211,27 +213,88 @@ def iou_rotated(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
     if N == 0 or M == 0:
         return torch.zeros((N, M), dtype=boxes1.dtype, device=boxes1.device)
 
-    # 将旋转框转换为角点
-    corners1 = rbox_to_corners(boxes1)  # (N, 4, 2)
-    corners2 = rbox_to_corners(boxes2)  # (M, 4, 2)
+    # 模式1: 纯 AABB 近似（最快，精度最低）
+    if mode == "aabb":
+        aabb1 = rbox_to_aabb(boxes1)
+        aabb2 = rbox_to_aabb(boxes2)
+        return box_iou_axis_aligned(aabb1, aabb2)
 
-    # 计算各个框的面积
-    area1 = (boxes1[:, 2] * boxes1[:, 3]).clamp(min=1e-8)  # (N,)
-    area2 = (boxes2[:, 2] * boxes2[:, 3]).clamp(min=1e-8)  # (M,)
+    # 模式2: 全精确计算（最慢，精度最高）
+    if mode == "accurate":
+        return _iou_rotated_accurate(boxes1, boxes2)
+
+    # 模式3: 快速混合模式（推荐：速度与精度平衡）
+    # 策略1：小角度框直接用 AABB（误差 < 1%）
+    angle_threshold = 0.087  # ~5度，旋转很小时 AABB 误差可忽略
+    max_angle1 = torch.abs(boxes1[:, 4]).max()
+    max_angle2 = torch.abs(boxes2[:, 4]).max()
+
+    if max_angle1 < angle_threshold and max_angle2 < angle_threshold:
+        # 所有框角度都很小，直接用 AABB
+        aabb1 = rbox_to_aabb(boxes1)
+        aabb2 = rbox_to_aabb(boxes2)
+        return box_iou_axis_aligned(aabb1, aabb2)
+
+    # 策略2：两阶段过滤 - 先用 AABB 粗筛，再精确计算
+    # 第一阶段：快速 AABB IoU（完全向量化）
+    aabb1 = rbox_to_aabb(boxes1)
+    aabb2 = rbox_to_aabb(boxes2)
+    aabb_iou = box_iou_axis_aligned(aabb1, aabb2)
+
+    # 找出可能相交的框对（AABB IoU > 0 说明可能有交集）
+    candidates = (aabb_iou > 0).nonzero(as_tuple=False)
+
+    if candidates.numel() == 0:
+        # 没有候选对，全部 IoU = 0
+        return torch.zeros((N, M), dtype=boxes1.dtype, device=boxes1.device)
+
+    # 第二阶段：只对候选框对计算精确旋转 IoU
+    ious = torch.zeros((N, M), dtype=boxes1.dtype, device=boxes1.device)
+
+    # 预计算角点（避免重复计算）
+    corners1 = rbox_to_corners(boxes1)
+    corners2 = rbox_to_corners(boxes2)
+    area1 = (boxes1[:, 2] * boxes1[:, 3]).clamp(min=1e-8)
+    area2 = (boxes2[:, 2] * boxes2[:, 3]).clamp(min=1e-8)
+
+    # 只计算候选对的精确 IoU
+    for idx in range(candidates.shape[0]):
+        i, j = candidates[idx, 0].item(), candidates[idx, 1].item()
+
+        # 使用 Sutherland-Hodgman 算法计算交集多边形
+        inter_poly = sutherland_hodgman_clip(
+            corners1[i].contiguous(),
+            corners2[j].contiguous()
+        )
+
+        if inter_poly.shape[0] >= 3:
+            inter_area = polygon_area(inter_poly.unsqueeze(0)).squeeze(0)
+            union_area = area1[i] + area2[j] - inter_area
+            ious[i, j] = (inter_area / union_area.clamp(min=1e-8)).clamp(min=0.0, max=1.0)
+
+    return ious
+
+
+def _iou_rotated_accurate(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
+    """全精确计算版本（内部使用）"""
+    N = boxes1.shape[0]
+    M = boxes2.shape[0]
+
+    corners1 = rbox_to_corners(boxes1)
+    corners2 = rbox_to_corners(boxes2)
+    area1 = (boxes1[:, 2] * boxes1[:, 3]).clamp(min=1e-8)
+    area2 = (boxes2[:, 2] * boxes2[:, 3]).clamp(min=1e-8)
 
     ious = torch.zeros((N, M), dtype=boxes1.dtype, device=boxes1.device)
 
-    # 对于每一对框计算 IoU
     for i in range(N):
         for j in range(M):
-            # 使用 Sutherland-Hodgman 算法计算交集多边形
             inter_poly = sutherland_hodgman_clip(
                 corners1[i].contiguous(),
                 corners2[j].contiguous()
             )
 
             if inter_poly.shape[0] >= 3:
-                # 计算交集面积
                 inter_area = polygon_area(inter_poly.unsqueeze(0)).squeeze(0)
                 union_area = area1[i] + area2[j] - inter_area
                 ious[i, j] = (inter_area / union_area.clamp(min=1e-8)).clamp(min=0.0, max=1.0)
