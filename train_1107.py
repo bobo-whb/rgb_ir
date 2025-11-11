@@ -237,7 +237,8 @@ def iou_rotated(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
         return cond1 & cond2 & cond3 & cond4  # (K,)
 
     # 分块处理，避免一次性占用过大显存
-    CHUNK = 16384
+    # 增大CHUNK以减少循环次数，加速计算（GPU显存充足时可设置更大）
+    CHUNK = 65536  # 从16384增加到65536
     ious = boxes1.new_zeros((N, M))
     for st in range(0, cand.shape[0], CHUNK):
         ed = min(st + CHUNK, cand.shape[0])
@@ -1100,55 +1101,73 @@ def train(args):
         logger.info(f"Epoch {epoch}/{args.epochs} | loss={loss_meter:.4f} (box {meter['l_box']:.2f} obj {meter['l_obj']:.2f} cls {meter['l_cls']:.2f}) | {dt:.1f}s")
 
         # ---- Evaluation ----
-                # ---- Evaluation ----
-        model.eval()
-        preds_all = []; gts_all = []
-        with torch.no_grad():
-            for rgbs, irs, targets, names in val_loader:
-                rgbs = rgbs.to(device); irs = irs.to(device)
-                outs = model(rgbs, irs)
-                dets = decode_predictions(outs, model.strides, conf_thr=0.1, img_size=args.imgsz, anchors=model.anchors)
-                dets = [nms_rotated_simple(d, iou_thr=args.nms_iou) for d in dets]
-                preds_all.extend(dets)
-                for t in targets:
-                    g = { "boxes": t["boxes"].to(device), "labels": t["labels"].to(device) }
-                    gts_all.append(g)
+        # 评估策略：
+        # - 前50个epoch每5轮评估一次（快速迭代）
+        # - 后50个epoch每2轮评估一次（精细调优）
+        # - 最后10个epoch每轮都评估（确保找到最佳模型）
+        should_eval = False
+        if epoch >= args.epochs - 10:
+            should_eval = True  # 最后10轮必评
+        elif epoch % args.eval_interval == 0:
+            should_eval = True
+        elif epoch <= 50 and epoch % 5 == 0:
+            should_eval = True  # 前50轮每5轮评估
+        elif epoch > 50 and epoch % 2 == 0:
+            should_eval = True  # 50轮后每2轮评估
 
-        P, R, mAP50, APs = compute_pr_map(
-            preds_all, gts_all, iou_thr=0.5,
-            num_classes=len(CANONICAL_CLASSES),
-            max_det=args.max_det
-        )
+        if should_eval:
+            t_eval_start = time.time()
+            model.eval()
+            preds_all = []; gts_all = []
+            with torch.no_grad():
+                for rgbs, irs, targets, names in val_loader:
+                    rgbs = rgbs.to(device); irs = irs.to(device)
+                    outs = model(rgbs, irs)
+                    dets = decode_predictions(outs, model.strides, conf_thr=args.conf_thres, img_size=args.imgsz, anchors=model.anchors)
+                    dets = [nms_rotated_simple(d, iou_thr=args.nms_iou) for d in dets]
+                    preds_all.extend(dets)
+                    for t in targets:
+                        g = { "boxes": t["boxes"].to(device), "labels": t["labels"].to(device) }
+                        gts_all.append(g)
 
-        # 将 AP50 按顺序输出：Car / Bus / Truck / Freight-car / Van
-        idx_map = {c: i for i, c in enumerate(CANONICAL_CLASSES)}
-        order = ["car", "bus", "truck", "freight_car", "van"]
-        name_map = {"car":"Car", "bus":"Bus", "truck":"Truck", "freight_car":"Freight-car", "van":"Van"}
+            P, R, mAP50, APs = compute_pr_map(
+                preds_all, gts_all, iou_thr=0.5,
+                num_classes=len(CANONICAL_CLASSES),
+                max_det=args.max_det
+            )
 
-        ap_table2 = {}
-        for cname in order:
-            ap_table2[name_map[cname]] = APs[idx_map[cname]] if cname in idx_map else 0.0
+            # 将 AP50 按顺序输出：Car / Bus / Truck / Freight-car / Van
+            idx_map = {c: i for i, c in enumerate(CANONICAL_CLASSES)}
+            order = ["car", "bus", "truck", "freight_car", "van"]
+            name_map = {"car":"Car", "bus":"Bus", "truck":"Truck", "freight_car":"Freight-car", "van":"Van"}
 
-        logger.info(
-            "Epoch %d VAL | mAP50=%.4f | AP50: Car=%.4f Bus=%.4f Truck=%.4f Freight-car=%.4f Van=%.4f | P=%.4f R=%.4f"
-            % (epoch, mAP50,
-               ap_table2["Car"], ap_table2["Bus"], ap_table2["Truck"], ap_table2["Freight-car"], ap_table2["Van"],
-               P, R)
-        )
+            ap_table2 = {}
+            for cname in order:
+                ap_table2[name_map[cname]] = APs[idx_map[cname]] if cname in idx_map else 0.0
 
-        if mAP50 > best_map:
-            best_map = mAP50
-            save_path = os.path.join(args.logdir, "best.pt")
-            torch.save({
-                "model": model.state_dict(),
-                "classes": CANONICAL_CLASSES,
-                "epoch": epoch,
-                "metrics": {
-                    "P": P, "R": R, "mAP50": mAP50,
-                    "AP50_per_class": ap_table2
-                }
-            }, save_path)
-            logger.info(f"Saved best to {save_path} (mAP50={mAP50:.4f})")
+            eval_time = time.time() - t_eval_start
+            logger.info(
+                "Epoch %d VAL | mAP50=%.4f | AP50: Car=%.4f Bus=%.4f Truck=%.4f Freight-car=%.4f Van=%.4f | P=%.4f R=%.4f | eval_time=%.1fs"
+                % (epoch, mAP50,
+                   ap_table2["Car"], ap_table2["Bus"], ap_table2["Truck"], ap_table2["Freight-car"], ap_table2["Van"],
+                   P, R, eval_time)
+            )
+
+            if mAP50 > best_map:
+                best_map = mAP50
+                save_path = os.path.join(args.logdir, "best.pt")
+                torch.save({
+                    "model": model.state_dict(),
+                    "classes": CANONICAL_CLASSES,
+                    "epoch": epoch,
+                    "metrics": {
+                        "P": P, "R": R, "mAP50": mAP50,
+                        "AP50_per_class": ap_table2
+                    }
+                }, save_path)
+                logger.info(f"Saved best to {save_path} (mAP50={mAP50:.4f})")
+        else:
+            logger.info(f"Epoch {epoch} | Skipping evaluation (will evaluate at epoch {epoch + (args.eval_interval - epoch % args.eval_interval)})")
 
     final_path = os.path.join(args.logdir, "last.pt")
     torch.save({"model": model.state_dict(), "classes": CANONICAL_CLASSES}, final_path)
@@ -1164,12 +1183,13 @@ def get_args():
     ap.add_argument("--batch",     type=int, default=8)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--lr",        type=float, default=1e-3)
-    ap.add_argument("--conf_thres",type=float, default=0.1)
+    ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
     ap.add_argument("--logdir",    type=str, default="./runs/test")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
     ap.add_argument("--max_det",       type=int, default=300)
+    ap.add_argument("--eval_interval", type=int, default=1, help="每隔N个epoch评估一次；设为1则每轮都评估")
     return ap.parse_args()
 
 if __name__ == "__main__":
