@@ -93,19 +93,150 @@ def rbox_to_aabb(box: torch.Tensor) -> torch.Tensor:
     x2 = x.max(-1).values; y2 = y.max(-1).values
     return torch.stack([x1,y1,x2,y2], dim=-1)
 
+def rbox_to_corners(boxes: torch.Tensor) -> torch.Tensor:
+    """
+    将旋转框 (cx, cy, w, h, angle) 转换为四个角点坐标
+    Args:
+        boxes: (..., 5) tensor, [cx, cy, w, h, angle(弧度)]
+    Returns:
+        corners: (..., 4, 2) tensor, 四个角点 (x, y)
+    """
+    cx, cy, w, h, angle = boxes.unbind(-1)
+    cos_a = torch.cos(angle)
+    sin_a = torch.sin(angle)
+
+    # 半宽半高
+    hw, hh = w * 0.5, h * 0.5
+
+    # 四个角点相对于中心的坐标（逆时针顺序）
+    dx = torch.stack([hw, -hw, -hw, hw], dim=-1)
+    dy = torch.stack([hh, hh, -hh, -hh], dim=-1)
+
+    # 旋转变换
+    cos_a = cos_a.unsqueeze(-1)
+    sin_a = sin_a.unsqueeze(-1)
+    x = cx.unsqueeze(-1) + dx * cos_a - dy * sin_a
+    y = cy.unsqueeze(-1) + dx * sin_a + dy * cos_a
+
+    return torch.stack([x, y], dim=-1)  # (..., 4, 2)
+
+
+def polygon_area(corners: torch.Tensor) -> torch.Tensor:
+    """
+    使用 Shoelace 公式计算多边形面积
+    Args:
+        corners: (..., N, 2) tensor, N个顶点
+    Returns:
+        area: (...,) tensor
+    """
+    x = corners[..., 0]
+    y = corners[..., 1]
+    # Shoelace formula
+    area = 0.5 * torch.abs(
+        torch.sum(x[..., :-1] * y[..., 1:] - x[..., 1:] * y[..., :-1], dim=-1) +
+        x[..., -1] * y[..., 0] - x[..., 0] * y[..., -1]
+    )
+    return area
+
+
+def sutherland_hodgman_clip(subject: torch.Tensor, clip: torch.Tensor) -> torch.Tensor:
+    """
+    Sutherland-Hodgman 多边形裁剪算法（单对样本）
+    Args:
+        subject: (4, 2) 被裁剪多边形的顶点
+        clip: (4, 2) 裁剪多边形的顶点
+    Returns:
+        result: (M, 2) 裁剪后的多边形顶点，M <= 8
+    """
+    def inside_edge(point, edge_p1, edge_p2):
+        # 判断点是否在边的左侧（使用叉积）
+        return (edge_p2[0] - edge_p1[0]) * (point[1] - edge_p1[1]) - \
+               (edge_p2[1] - edge_p1[1]) * (point[0] - edge_p1[0]) >= 0
+
+    def intersection(p1, p2, edge_p1, edge_p2):
+        # 计算线段与边的交点
+        dc = edge_p2 - edge_p1
+        dp = p1 - p2
+        n1 = (edge_p1[0] - p2[0]) * dc[1] - (edge_p1[1] - p2[1]) * dc[0]
+        n2 = dp[0] * dc[1] - dp[1] * dc[0]
+        n2 = torch.where(torch.abs(n2) < 1e-8, torch.ones_like(n2) * 1e-8, n2)
+        t = n1 / n2
+        return p2 + t.unsqueeze(-1) * dp
+
+    output_list = subject
+
+    for i in range(4):
+        if output_list.shape[0] == 0:
+            break
+
+        edge_p1 = clip[i]
+        edge_p2 = clip[(i + 1) % 4]
+        input_list = output_list
+        output_list = torch.zeros((0, 2), dtype=subject.dtype, device=subject.device)
+
+        if input_list.shape[0] == 0:
+            break
+
+        for j in range(input_list.shape[0]):
+            current = input_list[j]
+            previous = input_list[j - 1]
+
+            current_inside = inside_edge(current, edge_p1, edge_p2)
+            previous_inside = inside_edge(previous, edge_p1, edge_p2)
+
+            if current_inside:
+                if not previous_inside:
+                    inter = intersection(previous, current, edge_p1, edge_p2)
+                    output_list = torch.cat([output_list, inter.unsqueeze(0)], dim=0)
+                output_list = torch.cat([output_list, current.unsqueeze(0)], dim=0)
+            elif previous_inside:
+                inter = intersection(previous, current, edge_p1, edge_p2)
+                output_list = torch.cat([output_list, inter.unsqueeze(0)], dim=0)
+
+    return output_list
+
+
 def iou_rotated(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
-    try:
-        from torchvision.ops import box_iou_rotated as tv_box_iou_rotated
-        # ---- 修复 ①：弧度 -> 度，再调用官方旋转 IoU ----
-        b1 = boxes1.clone()
-        b2 = boxes2.clone()
-        b1[..., 4] = b1[..., 4] * (180.0 / math.pi)
-        b2[..., 4] = b2[..., 4] * (180.0 / math.pi)
-        return tv_box_iou_rotated(b1, b2)
-    except Exception:
-        b1 = rbox_to_aabb(boxes1)
-        b2 = rbox_to_aabb(boxes2)
-        return box_iou_axis_aligned(b1, b2)
+    """
+    计算旋转框的 IoU (纯 PyTorch 实现，支持 GPU)
+    Args:
+        boxes1: (N, 5) tensor, [cx, cy, w, h, angle(弧度)]
+        boxes2: (M, 5) tensor, [cx, cy, w, h, angle(弧度)]
+    Returns:
+        iou: (N, M) tensor
+    """
+    N = boxes1.shape[0]
+    M = boxes2.shape[0]
+
+    if N == 0 or M == 0:
+        return torch.zeros((N, M), dtype=boxes1.dtype, device=boxes1.device)
+
+    # 将旋转框转换为角点
+    corners1 = rbox_to_corners(boxes1)  # (N, 4, 2)
+    corners2 = rbox_to_corners(boxes2)  # (M, 4, 2)
+
+    # 计算各个框的面积
+    area1 = (boxes1[:, 2] * boxes1[:, 3]).clamp(min=1e-8)  # (N,)
+    area2 = (boxes2[:, 2] * boxes2[:, 3]).clamp(min=1e-8)  # (M,)
+
+    ious = torch.zeros((N, M), dtype=boxes1.dtype, device=boxes1.device)
+
+    # 对于每一对框计算 IoU
+    for i in range(N):
+        for j in range(M):
+            # 使用 Sutherland-Hodgman 算法计算交集多边形
+            inter_poly = sutherland_hodgman_clip(
+                corners1[i].contiguous(),
+                corners2[j].contiguous()
+            )
+
+            if inter_poly.shape[0] >= 3:
+                # 计算交集面积
+                inter_area = polygon_area(inter_poly.unsqueeze(0)).squeeze(0)
+                union_area = area1[i] + area2[j] - inter_area
+                ious[i, j] = (inter_area / union_area.clamp(min=1e-8)).clamp(min=0.0, max=1.0)
+
+    return ious
 
 def box_iou_axis_aligned(b1: torch.Tensor, b2: torch.Tensor) -> torch.Tensor:
     lt = torch.max(b1[:,None,:2], b2[None,:, :2])
