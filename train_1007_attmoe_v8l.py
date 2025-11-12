@@ -1090,56 +1090,58 @@ def train(args):
         for k in meter: meter[k] /= max(nb,1)
         logger.info(f"Epoch {epoch}/{args.epochs} | loss={loss_meter:.4f} (box {meter['l_box']:.2f} obj {meter['l_obj']:.2f} cls {meter['l_cls']:.2f}) | {dt:.1f}s")
 
-        # ---- Evaluation ----
-                # ---- Evaluation ----
-        model.eval()
-        preds_all = []; gts_all = []
-        with torch.no_grad():
-            for rgbs, irs, targets, names in val_loader:
-                rgbs = rgbs.to(device); irs = irs.to(device)
-                outs = model(rgbs, irs)
-                dets = decode_predictions(outs, model.strides, conf_thr=0.001, img_size=args.imgsz, anchors=model.anchors)
-                dets = [nms_rotated_simple(d, iou_thr=args.nms_iou) for d in dets]
-                preds_all.extend(dets)
-                for t in targets:
-                    g = { "boxes": t["boxes"].to(device), "labels": t["labels"].to(device) }
-                    gts_all.append(g)
+        # ---- Evaluation (从第20个epoch开始) ----
+        if epoch >= 20:
+            model.eval()
+            preds_all = []; gts_all = []
+            with torch.no_grad():
+                for rgbs, irs, targets, names in val_loader:
+                    rgbs = rgbs.to(device); irs = irs.to(device)
+                    outs = model(rgbs, irs)
+                    dets = decode_predictions(outs, model.strides, conf_thr=0.001, img_size=args.imgsz, anchors=model.anchors)
+                    dets = [nms_rotated_simple(d, iou_thr=args.nms_iou) for d in dets]
+                    preds_all.extend(dets)
+                    for t in targets:
+                        g = { "boxes": t["boxes"].to(device), "labels": t["labels"].to(device) }
+                        gts_all.append(g)
 
-        P, R, mAP50, APs = compute_pr_map(
-            preds_all, gts_all, iou_thr=0.5,
-            num_classes=len(CANONICAL_CLASSES),
-            max_det=args.max_det
-        )
+            P, R, mAP50, APs = compute_pr_map(
+                preds_all, gts_all, iou_thr=0.5,
+                num_classes=len(CANONICAL_CLASSES),
+                max_det=args.max_det
+            )
 
-        # 将 AP50 按顺序输出：Car / Bus / Truck / Freight-car / Van
-        idx_map = {c: i for i, c in enumerate(CANONICAL_CLASSES)}
-        order = ["car", "bus", "truck", "freight_car", "van"]
-        name_map = {"car":"Car", "bus":"Bus", "truck":"Truck", "freight_car":"Freight-car", "van":"Van"}
+            # 将 AP50 按顺序输出：Car / Bus / Truck / Freight-car / Van
+            idx_map = {c: i for i, c in enumerate(CANONICAL_CLASSES)}
+            order = ["car", "bus", "truck", "freight_car", "van"]
+            name_map = {"car":"Car", "bus":"Bus", "truck":"Truck", "freight_car":"Freight-car", "van":"Van"}
 
-        ap_table2 = {}
-        for cname in order:
-            ap_table2[name_map[cname]] = APs[idx_map[cname]] if cname in idx_map else 0.0
+            ap_table2 = {}
+            for cname in order:
+                ap_table2[name_map[cname]] = APs[idx_map[cname]] if cname in idx_map else 0.0
 
-        logger.info(
-            "Epoch %d VAL | mAP50=%.4f | AP50: Car=%.4f Bus=%.4f Truck=%.4f Freight-car=%.4f Van=%.4f | P=%.4f R=%.4f"
-            % (epoch, mAP50,
-               ap_table2["Car"], ap_table2["Bus"], ap_table2["Truck"], ap_table2["Freight-car"], ap_table2["Van"],
-               P, R)
-        )
+            logger.info(
+                "Epoch %d VAL | mAP50=%.4f | AP50: Car=%.4f Bus=%.4f Truck=%.4f Freight-car=%.4f Van=%.4f | P=%.4f R=%.4f"
+                % (epoch, mAP50,
+                   ap_table2["Car"], ap_table2["Bus"], ap_table2["Truck"], ap_table2["Freight-car"], ap_table2["Van"],
+                   P, R)
+            )
 
-        if mAP50 > best_map:
-            best_map = mAP50
-            save_path = os.path.join(args.logdir, "best.pt")
-            torch.save({
-                "model": model.state_dict(),
-                "classes": CANONICAL_CLASSES,
-                "epoch": epoch,
-                "metrics": {
-                    "P": P, "R": R, "mAP50": mAP50,
-                    "AP50_per_class": ap_table2
-                }
-            }, save_path)
-            logger.info(f"Saved best to {save_path} (mAP50={mAP50:.4f})")
+            if mAP50 > best_map:
+                best_map = mAP50
+                save_path = os.path.join(args.logdir, "best.pt")
+                torch.save({
+                    "model": model.state_dict(),
+                    "classes": CANONICAL_CLASSES,
+                    "epoch": epoch,
+                    "metrics": {
+                        "P": P, "R": R, "mAP50": mAP50,
+                        "AP50_per_class": ap_table2
+                    }
+                }, save_path)
+                logger.info(f"Saved best to {save_path} (mAP50={mAP50:.4f})")
+        else:
+            logger.info(f"Epoch {epoch}/{args.epochs} | Skipping evaluation (will start from epoch 20)")
 
     final_path = os.path.join(args.logdir, "last.pt")
     torch.save({"model": model.state_dict(), "classes": CANONICAL_CLASSES}, final_path)
