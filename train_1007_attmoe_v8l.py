@@ -921,7 +921,7 @@ def decode_predictions(preds, strides, conf_thr=0.25, img_size=640, anchors=None
 
     return out_per_im
 
-def nms_rotated_simple(dets: torch.Tensor, iou_thr=0.5, topk=300):
+def nms_rotated_simple(dets: torch.Tensor, iou_thr=0.5, topk=100):
     if dets.numel()==0: return dets
     keep = []
     for cls in dets[:,6].unique():
@@ -936,7 +936,7 @@ def nms_rotated_simple(dets: torch.Tensor, iou_thr=0.5, topk=300):
             D = D[1:][ious < iou_thr]
     return torch.cat(keep, dim=0) if keep else dets[:0]
 
-def compute_pr_map(preds_all, gts_all, iou_thr=0.5, num_classes=len(CANONICAL_CLASSES), max_det=300):
+def compute_pr_map(preds_all, gts_all, iou_thr=0.5, num_classes=len(CANONICAL_CLASSES), max_det=100):
     """
     preds_all: list[Tensor(M,7)] per image, [cx,cy,w,h,angle,conf,cls]
     gts_all:   list[dict{'boxes':(N,5), 'labels':(N,)}] per image
@@ -1160,7 +1160,7 @@ def get_args():
     ap.add_argument("--logdir",    type=str, default="./runs/test")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
-    ap.add_argument("--max_det",       type=int, default=300)
+    ap.add_argument("--max_det",       type=int, default=100)
     return ap.parse_args()
 
 if __name__ == "__main__":
