@@ -921,7 +921,7 @@ def decode_predictions(preds, strides, conf_thr=0.25, img_size=640, anchors=None
 
     return out_per_im
 
-def nms_rotated_simple(dets: torch.Tensor, iou_thr=0.5, topk=300):
+def nms_rotated_simple(dets: torch.Tensor, iou_thr=0.5, topk=100):
     if dets.numel()==0: return dets
     keep = []
     for cls in dets[:,6].unique():
@@ -936,7 +936,7 @@ def nms_rotated_simple(dets: torch.Tensor, iou_thr=0.5, topk=300):
             D = D[1:][ious < iou_thr]
     return torch.cat(keep, dim=0) if keep else dets[:0]
 
-def compute_pr_map(preds_all, gts_all, iou_thr=0.5, num_classes=len(CANONICAL_CLASSES), max_det=300):
+def compute_pr_map(preds_all, gts_all, iou_thr=0.5, num_classes=len(CANONICAL_CLASSES), max_det=100):
     """
     preds_all: list[Tensor(M,7)] per image, [cx,cy,w,h,angle,conf,cls]
     gts_all:   list[dict{'boxes':(N,5), 'labels':(N,)}] per image
@@ -1090,56 +1090,58 @@ def train(args):
         for k in meter: meter[k] /= max(nb,1)
         logger.info(f"Epoch {epoch}/{args.epochs} | loss={loss_meter:.4f} (box {meter['l_box']:.2f} obj {meter['l_obj']:.2f} cls {meter['l_cls']:.2f}) | {dt:.1f}s")
 
-        # ---- Evaluation ----
-                # ---- Evaluation ----
-        model.eval()
-        preds_all = []; gts_all = []
-        with torch.no_grad():
-            for rgbs, irs, targets, names in val_loader:
-                rgbs = rgbs.to(device); irs = irs.to(device)
-                outs = model(rgbs, irs)
-                dets = decode_predictions(outs, model.strides, conf_thr=0.001, img_size=args.imgsz, anchors=model.anchors)
-                dets = [nms_rotated_simple(d, iou_thr=args.nms_iou) for d in dets]
-                preds_all.extend(dets)
-                for t in targets:
-                    g = { "boxes": t["boxes"].to(device), "labels": t["labels"].to(device) }
-                    gts_all.append(g)
+        # ---- Evaluation (从第20个epoch开始) ----
+        if epoch >= 20:
+            model.eval()
+            preds_all = []; gts_all = []
+            with torch.no_grad():
+                for rgbs, irs, targets, names in val_loader:
+                    rgbs = rgbs.to(device); irs = irs.to(device)
+                    outs = model(rgbs, irs)
+                    dets = decode_predictions(outs, model.strides, conf_thr=0.001, img_size=args.imgsz, anchors=model.anchors)
+                    dets = [nms_rotated_simple(d, iou_thr=args.nms_iou) for d in dets]
+                    preds_all.extend(dets)
+                    for t in targets:
+                        g = { "boxes": t["boxes"].to(device), "labels": t["labels"].to(device) }
+                        gts_all.append(g)
 
-        P, R, mAP50, APs = compute_pr_map(
-            preds_all, gts_all, iou_thr=0.5,
-            num_classes=len(CANONICAL_CLASSES),
-            max_det=args.max_det
-        )
+            P, R, mAP50, APs = compute_pr_map(
+                preds_all, gts_all, iou_thr=0.5,
+                num_classes=len(CANONICAL_CLASSES),
+                max_det=args.max_det
+            )
 
-        # 将 AP50 按顺序输出：Car / Bus / Truck / Freight-car / Van
-        idx_map = {c: i for i, c in enumerate(CANONICAL_CLASSES)}
-        order = ["car", "bus", "truck", "freight_car", "van"]
-        name_map = {"car":"Car", "bus":"Bus", "truck":"Truck", "freight_car":"Freight-car", "van":"Van"}
+            # 将 AP50 按顺序输出：Car / Bus / Truck / Freight-car / Van
+            idx_map = {c: i for i, c in enumerate(CANONICAL_CLASSES)}
+            order = ["car", "bus", "truck", "freight_car", "van"]
+            name_map = {"car":"Car", "bus":"Bus", "truck":"Truck", "freight_car":"Freight-car", "van":"Van"}
 
-        ap_table2 = {}
-        for cname in order:
-            ap_table2[name_map[cname]] = APs[idx_map[cname]] if cname in idx_map else 0.0
+            ap_table2 = {}
+            for cname in order:
+                ap_table2[name_map[cname]] = APs[idx_map[cname]] if cname in idx_map else 0.0
 
-        logger.info(
-            "Epoch %d VAL | mAP50=%.4f | AP50: Car=%.4f Bus=%.4f Truck=%.4f Freight-car=%.4f Van=%.4f | P=%.4f R=%.4f"
-            % (epoch, mAP50,
-               ap_table2["Car"], ap_table2["Bus"], ap_table2["Truck"], ap_table2["Freight-car"], ap_table2["Van"],
-               P, R)
-        )
+            logger.info(
+                "Epoch %d VAL | mAP50=%.4f | AP50: Car=%.4f Bus=%.4f Truck=%.4f Freight-car=%.4f Van=%.4f | P=%.4f R=%.4f"
+                % (epoch, mAP50,
+                   ap_table2["Car"], ap_table2["Bus"], ap_table2["Truck"], ap_table2["Freight-car"], ap_table2["Van"],
+                   P, R)
+            )
 
-        if mAP50 > best_map:
-            best_map = mAP50
-            save_path = os.path.join(args.logdir, "best.pt")
-            torch.save({
-                "model": model.state_dict(),
-                "classes": CANONICAL_CLASSES,
-                "epoch": epoch,
-                "metrics": {
-                    "P": P, "R": R, "mAP50": mAP50,
-                    "AP50_per_class": ap_table2
-                }
-            }, save_path)
-            logger.info(f"Saved best to {save_path} (mAP50={mAP50:.4f})")
+            if mAP50 > best_map:
+                best_map = mAP50
+                save_path = os.path.join(args.logdir, "best.pt")
+                torch.save({
+                    "model": model.state_dict(),
+                    "classes": CANONICAL_CLASSES,
+                    "epoch": epoch,
+                    "metrics": {
+                        "P": P, "R": R, "mAP50": mAP50,
+                        "AP50_per_class": ap_table2
+                    }
+                }, save_path)
+                logger.info(f"Saved best to {save_path} (mAP50={mAP50:.4f})")
+        else:
+            logger.info(f"Epoch {epoch}/{args.epochs} | Skipping evaluation (will start from epoch 20)")
 
     final_path = os.path.join(args.logdir, "last.pt")
     torch.save({"model": model.state_dict(), "classes": CANONICAL_CLASSES}, final_path)
@@ -1160,7 +1162,7 @@ def get_args():
     ap.add_argument("--logdir",    type=str, default="./runs/test")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
-    ap.add_argument("--max_det",       type=int, default=300)
+    ap.add_argument("--max_det",       type=int, default=100)
     return ap.parse_args()
 
 if __name__ == "__main__":
