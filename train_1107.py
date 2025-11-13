@@ -237,7 +237,7 @@ def iou_rotated(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
         return cond1 & cond2 & cond3 & cond4  # (K,)
 
     # 分块处理，避免一次性占用过大显存
-    CHUNK = 16384
+    CHUNK = 65536
     ious = boxes1.new_zeros((N, M))
     for st in range(0, cand.shape[0], CHUNK):
         ed = min(st + CHUNK, cand.shape[0])
@@ -856,7 +856,7 @@ class DualYoloV8L(nn.Module):
         outs = self.detect([F3, F4, F5])
         return outs
 
-def decode_predictions(preds, strides, conf_thr=0.25, img_size=640, anchors=None):
+def decode_predictions(preds, strides, conf_thr=0.001, img_size=640, anchors=None):
     """
     Convert raw head outputs to absolute coords for NMS
     Return list per image of detections: [cx,cy,w,h,angle, conf, cls_id]
@@ -1107,7 +1107,7 @@ def train(args):
             for rgbs, irs, targets, names in val_loader:
                 rgbs = rgbs.to(device); irs = irs.to(device)
                 outs = model(rgbs, irs)
-                dets = decode_predictions(outs, model.strides, conf_thr=0.1, img_size=args.imgsz, anchors=model.anchors)
+                dets = decode_predictions(outs, model.strides, conf_thr=0.001, img_size=args.imgsz, anchors=model.anchors)
                 dets = [nms_rotated_simple(d, iou_thr=args.nms_iou) for d in dets]
                 preds_all.extend(dets)
                 for t in targets:
@@ -1164,9 +1164,9 @@ def get_args():
     ap.add_argument("--batch",     type=int, default=8)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--lr",        type=float, default=1e-3)
-    ap.add_argument("--conf_thres",type=float, default=0.1)
+    ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
-    ap.add_argument("--logdir",    type=str, default="./runs/test")
+    ap.add_argument("--logdir",    type=str, default="./runs/1111")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
     ap.add_argument("--max_det",       type=int, default=300)
