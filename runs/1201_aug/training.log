@@ -1,0 +1,46 @@
+2025-12-01 00:40:14,426 | INFO | Using CUDA device cuda:2 — NVIDIA GeForce RTX 4090
+2025-12-01 00:45:05,290 | INFO | Using CUDA device cuda:2 — NVIDIA GeForce RTX 4090
+2025-12-01 00:57:15,860 | INFO | Epoch 1/100 | loss=1252.1908 (box 507.56 obj 1044.43 cls 364.76) | 728.2s
+2025-12-01 00:57:15,861 | INFO | Epoch 1/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 01:09:11,230 | INFO | Epoch 2/100 | loss=655.0722 (box 477.50 obj 496.51 cls 269.37) | 715.4s
+2025-12-01 01:09:11,231 | INFO | Epoch 2/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 01:21:51,885 | INFO | Epoch 3/100 | loss=600.2631 (box 470.74 obj 456.06 cls 241.32) | 760.6s
+2025-12-01 01:21:51,887 | INFO | Epoch 3/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 01:34:37,771 | INFO | Epoch 4/100 | loss=572.2333 (box 469.22 obj 436.95 cls 223.64) | 765.9s
+2025-12-01 01:34:37,773 | INFO | Epoch 4/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 01:47:13,312 | INFO | Epoch 5/100 | loss=550.4973 (box 467.74 obj 422.13 cls 209.96) | 755.5s
+2025-12-01 01:47:13,313 | INFO | Epoch 5/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 01:59:46,081 | INFO | Epoch 6/100 | loss=533.3696 (box 467.54 obj 410.44 cls 199.11) | 752.8s
+2025-12-01 01:59:46,082 | INFO | Epoch 6/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 02:12:15,693 | INFO | Epoch 7/100 | loss=522.7612 (box 466.53 obj 403.94 cls 190.99) | 749.6s
+2025-12-01 02:12:15,698 | INFO | Epoch 7/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 02:24:34,316 | INFO | Epoch 8/100 | loss=514.2618 (box 466.39 obj 399.70 cls 182.48) | 738.6s
+2025-12-01 02:24:34,317 | INFO | Epoch 8/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 02:36:51,100 | INFO | Epoch 9/100 | loss=504.8118 (box 464.48 obj 394.29 cls 174.60) | 736.8s
+2025-12-01 02:36:51,102 | INFO | Epoch 9/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 02:48:54,431 | INFO | Epoch 10/100 | loss=497.2464 (box 463.13 obj 389.04 cls 170.10) | 723.3s
+2025-12-01 02:48:54,433 | INFO | Epoch 10/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 03:00:52,762 | INFO | Epoch 11/100 | loss=493.3821 (box 465.03 obj 387.69 cls 164.89) | 718.3s
+2025-12-01 03:00:52,763 | INFO | Epoch 11/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 03:13:01,243 | INFO | Epoch 12/100 | loss=484.5677 (box 461.91 obj 382.35 cls 158.24) | 728.5s
+2025-12-01 03:13:01,246 | INFO | Epoch 12/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 03:25:10,223 | INFO | Epoch 13/100 | loss=480.3155 (box 458.63 obj 380.24 cls 154.29) | 729.0s
+2025-12-01 03:25:10,225 | INFO | Epoch 13/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 03:37:18,481 | INFO | Epoch 14/100 | loss=475.4645 (box 459.23 obj 377.69 cls 149.62) | 728.2s
+2025-12-01 03:37:18,482 | INFO | Epoch 14/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 03:49:35,992 | INFO | Epoch 15/100 | loss=471.9961 (box 457.77 obj 376.25 cls 145.71) | 737.5s
+2025-12-01 03:49:35,993 | INFO | Epoch 15/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 04:01:49,854 | INFO | Epoch 16/100 | loss=467.0394 (box 455.19 obj 373.46 cls 141.63) | 733.9s
+2025-12-01 04:01:49,856 | INFO | Epoch 16/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 04:13:53,576 | INFO | Epoch 17/100 | loss=463.9546 (box 453.10 obj 371.61 cls 139.37) | 723.7s
+2025-12-01 04:13:53,578 | INFO | Epoch 17/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 04:25:53,760 | INFO | Epoch 18/100 | loss=460.3790 (box 452.39 obj 369.60 cls 136.33) | 720.2s
+2025-12-01 04:25:53,762 | INFO | Epoch 18/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 04:37:54,344 | INFO | Epoch 19/100 | loss=457.6263 (box 450.27 obj 367.98 cls 134.27) | 720.6s
+2025-12-01 04:37:54,345 | INFO | Epoch 19/100 | Skipping evaluation (will start from epoch 20)
+2025-12-01 04:50:04,961 | INFO | Epoch 20/100 | loss=454.2555 (box 450.14 obj 366.15 cls 131.19) | 730.6s
+2025-12-01 09:03:52,786 | INFO | Epoch 20 VAL | mAP50=0.1010 | AP50: Car=0.2619 Bus=0.0461 Truck=0.0455 Freight-car=0.0606 Van=0.0909 | P=0.0876 R=0.1689
+2025-12-01 09:03:52,997 | INFO | Saved best to ./runs/1201_aug/best.pt (mAP50=0.1010)
+2025-12-01 09:15:49,003 | INFO | Epoch 21/100 | loss=451.1575 (box 449.54 obj 363.92 cls 129.53) | 716.0s
+2025-12-01 13:22:58,329 | INFO | Epoch 21 VAL | mAP50=0.0933 | AP50: Car=0.2394 Bus=0.1027 Truck=0.0182 Freight-car=0.0152 Van=0.0909 | P=0.0609 R=0.1853
+2025-12-01 13:34:55,260 | INFO | Epoch 22/100 | loss=447.6572 (box 447.69 obj 362.27 cls 126.02) | 716.9s
