@@ -916,100 +916,188 @@ class DualFusionNeckXAttnL(nn.Module):
         return F3, F4, F5
 
 class DetectHead(nn.Module):
-    def __init__(self, nc: int, anchors: List[List[Tuple[int,int]]], ch: List[int]):
+    """
+    Anchor-free 解耦头 + DFL（对齐 YOLOv8 思路）
+      - reg 分支输出 4*(reg_max+1) 的离散距离分布
+      - cls 分支输出 nc 类概率（无 obj 分支）
+    """
+    def __init__(self, nc: int, ch: List[int], reg_max: int = 16):
         super().__init__()
         self.nc = nc
-        self.no = 5 + nc
-        self.nl = len(anchors)
-        self.na = len(anchors[0])
-        self.register_buffer("anchors", torch.tensor(anchors).float())
-        self.m = nn.ModuleList([nn.Conv2d(c, self.no*self.na, 1) for c in ch])
+        self.reg_max = reg_max
+        self.nl = len(ch)
+
+        self.stems = nn.ModuleList([ConvBNAct(c, c, k=1, s=1) for c in ch])
+        self.cls_conv = nn.ModuleList([nn.Sequential(
+            ConvBNAct(c, c, 3, 1),
+            ConvBNAct(c, c, 3, 1)
+        ) for c in ch])
+        self.reg_conv = nn.ModuleList([nn.Sequential(
+            ConvBNAct(c, c, 3, 1),
+            ConvBNAct(c, c, 3, 1)
+        ) for c in ch])
+
+        self.cls_pred = nn.ModuleList([nn.Conv2d(c, nc, 1) for c in ch])
+        self.reg_pred = nn.ModuleList([nn.Conv2d(c, 4 * (reg_max + 1), 1) for c in ch])
 
     def forward(self, feats: List[torch.Tensor]):
-        outs = []
+        outputs = []
         for i, x in enumerate(feats):
-            bs, _, h, w = x.shape
-            x = self.m[i](x)
-            x = x.view(bs, self.na, self.no, h, w).permute(0,1,3,4,2).contiguous()
-            outs.append(x)
-        return outs
+            x = self.stems[i](x)
+            cls_feat = self.cls_conv[i](x)
+            reg_feat = self.reg_conv[i](x)
+            cls_out = self.cls_pred[i](cls_feat)          # (B, nc, H, W)
+            reg_out = self.reg_pred[i](reg_feat)          # (B, 4*(reg_max+1), H, W)
+            outputs.append((reg_out, cls_out))
+        return outputs
 
 class YoloLoss(nn.Module):
-    def __init__(self, anchors, num_classes: int, img_size: int = 640,
-                 lambda_box=0.05, lambda_obj=1.0, lambda_cls=0.5, iou_t=0.5):
+    """
+    更贴近 YOLOv8 的 anchor-free + DFL 损失：
+      - 正样本：中心落入 GT 且在中心半径范围内，若无则取距中心最近 topk
+      - cls：Focal BCE，软标签为 IoU（TaskAligned 风格）
+      - reg：IoU 损失；DFL：离散距离分布
+    """
+    def __init__(self, num_classes: int, reg_max: int = 16,
+                 lambda_box=7.5, lambda_cls=1.0, lambda_dfl=1.5,
+                 center_radius: float = 2.5, topk: int = 10):
         super().__init__()
-        self.anchors = anchors
         self.nc = num_classes
-        self.img_size = img_size
+        self.reg_max = reg_max
         self.l_box = lambda_box
-        self.l_obj = lambda_obj
         self.l_cls = lambda_cls
-        self.iou_t = iou_t
+        self.l_dfl = lambda_dfl
+        self.center_radius = center_radius
+        self.topk = topk
 
-    def forward(self, preds, targets, strides):
-        device = preds[0].device
-        bs = preds[0].shape[0]
-        obj_loss = torch.zeros(1, device=device)
-        cls_loss = torch.zeros(1, device=device)
-        box_loss = torch.zeros(1, device=device)
+    @staticmethod
+    def bbox_iou(box1, box2):
+        inter = (torch.min(box1[..., 2:], box2[..., 2:]) - torch.max(box1[..., :2], box2[..., :2])).clamp(min=0)
+        inter_area = inter[..., 0] * inter[..., 1]
+        area1 = (box1[..., 2] - box1[..., 0]) * (box1[..., 3] - box1[..., 1])
+        area2 = (box2[..., 2] - box2[..., 0]) * (box2[..., 3] - box2[..., 1])
+        union = area1 + area2 - inter_area + 1e-6
+        return inter_area / union
+
+    def dfl_loss(self, pred, target):
+        n, _, bins = pred.shape
+        t = target.clamp(min=0, max=self.reg_max - 1e-4)
+        l = t.floor().long()
+        r = (l + 1).clamp(max=self.reg_max)
+        wl = r.float() - t
+        wr = t - l.float()
+        pred = pred.reshape(n * 4, bins)
+        l_loss = F.cross_entropy(pred, l.reshape(-1), reduction="none")
+        r_loss = F.cross_entropy(pred, r.reshape(-1), reduction="none")
+        return (l_loss * wl.view(-1) + r_loss * wr.view(-1)).mean()
+
+    def focal_bce(self, logits, targets, alpha=0.25, gamma=2.0):
+        prob = logits.sigmoid()
+        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        p_t = prob * targets + (1 - prob) * (1 - targets)
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        return ce * alpha_t * ((1 - p_t) ** gamma)
+
+    def forward(self, preds, targets, strides, device=None):
+        device = preds[0][0].device
+        bs = len(targets)
+        total_box = torch.zeros(1, device=device)
+        total_cls = torch.zeros(1, device=device)
+        total_dfl = torch.zeros(1, device=device)
 
         for b in range(bs):
             tboxes = targets[b]["boxes"].to(device)
             tcls   = targets[b]["labels"].to(device)
             if tboxes.numel() == 0:
-                for l, p in enumerate(preds):
-                    obj = p[b, ..., 4]
-                    obj_loss = obj_loss + F.binary_cross_entropy_with_logits(obj, torch.zeros_like(obj), reduction="sum")
+                for _, cls_out in preds:
+                    total_cls += F.binary_cross_entropy_with_logits(cls_out[b], torch.zeros_like(cls_out[b]), reduction="sum")
                 continue
 
-            xy = (tboxes[:, :2] + tboxes[:, 2:4]) * 0.5
-            wh = (tboxes[:, 2:4] - tboxes[:, :2]).clamp(min=1.0)
-
-            for l, p in enumerate(preds):
-                na = p.shape[1]; h = p.shape[2]; w = p.shape[3]; no = p.shape[-1]
+            for l, (reg_out, cls_out) in enumerate(preds):
                 stride = strides[l]
-                gxy = xy / stride
-                gwh = wh / stride
+                _, _, h, w = cls_out.shape
+                gy, gx = torch.meshgrid(
+                    torch.arange(h, device=device),
+                    torch.arange(w, device=device),
+                    indexing="ij"
+                )
+                centers = torch.stack([gx + 0.5, gy + 0.5], dim=-1).view(-1, 2)  # (HW,2)
 
-                anc = torch.tensor(self.anchors[l], device=device, dtype=torch.float32) / stride
-                ratios = gwh[:,None,:] / anc[None,:,:]
-                ar = torch.max(ratios, 1.0/ratios).max(dim=2).values
-                best = ar.argmin(dim=1)
+                gt = tboxes / stride
+                gtc = tcls
+                gt_xy1 = gt[:, :2]
+                gt_xy2 = gt[:, 2:4]
+                gt_ctr = (gt_xy1 + gt_xy2) * 0.5
 
-                gij = gxy.long()
-                gi = gij[:,0].clamp(0, w-1); gj = gij[:,1].clamp(0, h-1)
+                left = centers[:, None, 0] - gt_xy1[None, :, 0]
+                top = centers[:, None, 1] - gt_xy1[None, :, 1]
+                right = gt_xy2[None, :, 0] - centers[:, None, 0]
+                bottom = gt_xy2[None, :, 1] - centers[:, None, 1]
+                in_gt = (left > 0) & (top > 0) & (right > 0) & (bottom > 0)
 
-                sel = p[b, best, gj, gi]
-                px,py,pw,ph,pobj = sel[:,0],sel[:,1],sel[:,2],sel[:,3],sel[:,4]
-                pcls = sel[:,5:]
+                radius = self.center_radius
+                in_ctr = (centers[:, None, 0] >= (gt_ctr[None, :, 0] - radius)) & \
+                         (centers[:, None, 0] <= (gt_ctr[None, :, 0] + radius)) & \
+                         (centers[:, None, 1] >= (gt_ctr[None, :, 1] - radius)) & \
+                         (centers[:, None, 1] <= (gt_ctr[None, :, 1] + radius))
 
-                tx = gxy[:,0] - gi.float()
-                ty = gxy[:,1] - gj.float()
-                tw_tgt = torch.log(gwh[:,0] / anc[best,0] + 1e-6).clamp(min=-4.0, max=4.0)
-                th_tgt = torch.log(gwh[:,1] / anc[best,1] + 1e-6).clamp(min=-4.0, max=4.0)
-                tw_pred = pw.clamp(min=-4.0, max=4.0)
-                th_pred = ph.clamp(min=-4.0, max=4.0)
+                mask = in_gt & in_ctr
 
-                box_loss = box_loss + F.smooth_l1_loss(px, tx, reduction="sum")
-                box_loss = box_loss + F.smooth_l1_loss(py, ty, reduction="sum")
-                box_loss = box_loss + F.smooth_l1_loss(tw_pred, tw_tgt, reduction="sum")
-                box_loss = box_loss + F.smooth_l1_loss(th_pred, th_tgt, reduction="sum")
+                if not mask.any():
+                    dist = (centers[:, None, :] - gt_ctr[None, :, :]).pow(2).sum(-1).sqrt()
+                    topk = min(self.topk, centers.size(0))
+                    _, idx = dist.topk(topk, dim=0, largest=False)
+                    mask = torch.zeros_like(dist, dtype=torch.bool)
+                    mask.scatter_(0, idx, True)
 
-                obj_loss = obj_loss + F.binary_cross_entropy_with_logits(pobj, torch.ones_like(pobj), reduction="sum")
-                tgt = torch.zeros_like(pcls)
-                tgt[torch.arange(tcls.numel(), device=device), tcls] = 1.0
-                cls_loss = cls_loss + F.binary_cross_entropy_with_logits(pcls, tgt, reduction="sum")
+                pos_idx = mask.nonzero(as_tuple=False)
+                if pos_idx.numel() == 0:
+                    total_cls += F.binary_cross_entropy_with_logits(cls_out[b], torch.zeros_like(cls_out[b]), reduction="sum")
+                    continue
 
-                K = min(1000, (h*w*na))
-                if K > 0:
-                    ri = torch.randint(0, na, (K,), device=device)
-                    rj = torch.randint(0, h,  (K,), device=device)
-                    rk = torch.randint(0, w,  (K,), device=device)
-                    neg = p[b, ri, rj, rk, 4]
-                    obj_loss = obj_loss + F.binary_cross_entropy_with_logits(neg, torch.zeros_like(neg), reduction="sum")
+                point_idx = pos_idx[:, 0]
+                gt_idx = pos_idx[:, 1]
+                cxcy = centers[point_idx]
+                assigned_gt = gt[gt_idx]
+                assigned_cls = gtc[gt_idx]
 
-        loss = self.l_box*box_loss + self.l_obj*obj_loss + self.l_cls*cls_loss
-        return loss, {"l_box": box_loss.item(),"l_obj": obj_loss.item(),"l_cls": cls_loss.item()}
+                ltrb = torch.stack([
+                    cxcy[:, 0] - assigned_gt[:, 0],
+                    cxcy[:, 1] - assigned_gt[:, 1],
+                    assigned_gt[:, 2] - cxcy[:, 0],
+                    assigned_gt[:, 3] - cxcy[:, 1],
+                ], dim=1).clamp(min=0)
+
+                cls_flat = cls_out[b].permute(1, 2, 0).reshape(-1, self.nc)
+                reg_flat = reg_out[b].permute(1, 2, 0).reshape(-1, 4, self.reg_max + 1)
+                cls_sel = cls_flat[point_idx]
+                reg_sel = reg_flat[point_idx]
+
+                total_dfl += self.dfl_loss(reg_sel, ltrb)
+
+                reg_prob = reg_sel.softmax(-1)
+                proj = reg_prob * torch.arange(self.reg_max + 1, device=device)
+                dist = proj.sum(-1)
+                x1 = cxcy[:, 0] - dist[:, 0]
+                y1 = cxcy[:, 1] - dist[:, 1]
+                x2 = cxcy[:, 0] + dist[:, 2]
+                y2 = cxcy[:, 1] + dist[:, 3]
+                pred_box = torch.stack([x1, y1, x2, y2], dim=1)
+                iou = self.bbox_iou(pred_box, assigned_gt).detach()
+                total_box += (1 - iou).sum()
+
+                cls_target = torch.zeros_like(cls_sel)
+                cls_target[torch.arange(cls_sel.size(0)), assigned_cls] = iou
+                total_cls += self.focal_bce(cls_sel, cls_target).sum()
+
+                neg_mask = torch.ones((h * w,), device=device, dtype=torch.bool)
+                neg_mask[point_idx] = False
+                if neg_mask.any():
+                    cls_neg = cls_flat[neg_mask]
+                    total_cls += self.focal_bce(cls_neg, torch.zeros_like(cls_neg)).sum()
+
+        loss = self.l_box * total_box + self.l_cls * total_cls + self.l_dfl * total_dfl
+        return loss, {"l_box": total_box.item(), "l_cls": total_cls.item(), "l_dfl": total_dfl.item()}
 
 class DualYoloV8L(nn.Module):
     def __init__(self, num_classes: int):
@@ -1025,15 +1113,9 @@ class DualYoloV8L(nn.Module):
             reduction=16
         )
 
-        # 可保持你原来的锚框；若数据分布差别较大，建议重聚类
-        anchors = [
-            [(10,13), (16,30), (33,23)],
-            [(30,61), (62,45), (59,119)],
-            [(116,90), (156,198), (373,326)]
-        ]
-        self.detect = DetectHead(num_classes, anchors, ch=[256, 512, 1024])
+        # anchor-free 检测头
+        self.detect = DetectHead(num_classes, ch=[256, 512, 1024], reg_max=16)
         self.strides = [8, 16, 32]
-        self.anchors = anchors
 
     def forward(self, rgb, ir):
         r3, r4, r5 = self.rgb_backbone(rgb)
@@ -1042,72 +1124,52 @@ class DualYoloV8L(nn.Module):
         outs = self.detect([F3, F4, F5])
         return outs
 
-def decode_predictions(preds, strides, conf_thr=0.25, img_size=640, anchors=None):
+def decode_predictions(preds, strides, conf_thr=0.25, img_size=640, reg_max=16):
     """
-    Convert raw head outputs to absolute coords for NMS
-    Return list per image of detections: [x1,y1,x2,y2, conf, cls_id]
-    anchors: optional List[List[Tuple[w,h]]] per level; if None,从模型的 detect.anchors 取
+    Anchor-free 解码：preds: List[(reg_out, cls_out)] per level
+    返回 [B] -> (N,6) [x1,y1,x2,y2,conf,cls]
     """
-    device = preds[0].device
-    bs = preds[0].shape[0]
+    device = preds[0][0].device
+    bs = preds[0][0].shape[0]
     out_per_im = [[] for _ in range(bs)]
 
-    if anchors is None:
-        anchors = [
-            [(10,13), (16,30), (33,23)],     # P3
-            [(30,61), (62,45), (59,119)],    # P4
-            [(116,90), (156,198), (373,326)] # P5
-        ]
-
-    for l, p in enumerate(preds):
-        na = int(p.size(1)); h = int(p.size(2)); w = int(p.size(3)); no = int(p.size(4))
+    for l, (reg_out, cls_out) in enumerate(preds):
+        B, _, H, W = cls_out.shape
         stride = strides[l]
-
+        # 构造网格中心
         gy, gx = torch.meshgrid(
-            torch.arange(h, device=device),
-            torch.arange(w, device=device),
-            indexing="ij",
+            torch.arange(H, device=device),
+            torch.arange(W, device=device),
+            indexing="ij"
         )
+        cx = (gx + 0.5) * stride
+        cy = (gy + 0.5) * stride
+        cx = cx.view(-1)
+        cy = cy.view(-1)
 
-        anc_lvl = torch.tensor(anchors[l], device=device, dtype=torch.float32)
-        anc_w = anc_lvl[:, 0].view(na, 1, 1).expand(na, h, w)
-        anc_h = anc_lvl[:, 1].view(na, 1, 1).expand(na, h, w)
+        # 回归距离
+        reg_out = reg_out.permute(0, 2, 3, 1).reshape(B, -1, 4, reg_max + 1)
+        reg_prob = reg_out.softmax(-1)
+        proj = reg_prob * torch.arange(reg_max + 1, device=device)
+        dist = proj.sum(-1) * stride  # (B, N, 4)
 
-        for b in range(bs):
-            x = p[b]  # (na,h,w,no)
+        x1 = cx[None, :] - dist[:, :, 0]
+        y1 = cy[None, :] - dist[:, :, 1]
+        x2 = cx[None, :] + dist[:, :, 2]
+        y2 = cy[None, :] + dist[:, :, 3]
 
-            obj = x[..., 4].sigmoid()
-            cls = x[..., 5:].sigmoid()
-            conf, cls_id = (obj[..., None] * cls).max(dim=-1)
+        cls_prob = cls_out.permute(0, 2, 3, 1).reshape(B, -1, cls_out.size(1)).sigmoid()
+        conf, cls_id = cls_prob.max(dim=-1)
 
-            mask = conf > conf_thr
+        for b in range(B):
+            mask = conf[b] > conf_thr
             if not mask.any():
                 continue
-
-            sel = x[mask]
-            gi = gx.unsqueeze(0).expand(na, -1, -1)[mask]
-            gj = gy.unsqueeze(0).expand(na, -1, -1)[mask]
-
-            aw = anc_w[mask]
-            ah = anc_h[mask]
-
-            # 解码（训练预测为相对偏移/对数缩放）
-            cx = (sel[:, 0] + gi.float()) * stride
-            cy = (sel[:, 1] + gj.float()) * stride
-            w_abs = aw * torch.exp(sel[:, 2])
-            h_abs = ah * torch.exp(sel[:, 3])
-
-            x1 = cx - w_abs * 0.5
-            y1 = cy - h_abs * 0.5
-            x2 = cx + w_abs * 0.5
-            y2 = cy + h_abs * 0.5
-
-            c = conf[mask]
-            # ---- 修复 ③：类别 id 转 long，然后为拼接统一转回 float ----
-            cid_long = cls_id[mask].to(dtype=torch.long)
-            cid = cid_long.to(dtype=torch.float32)
-
-            det = torch.stack([x1, y1, x2, y2, c, cid], dim=-1)
+            det = torch.stack([
+                x1[b, mask], y1[b, mask], x2[b, mask], y2[b, mask],
+                conf[b, mask],
+                cls_id[b, mask].float()
+            ], dim=-1)
             out_per_im[b].append(det)
 
     for b in range(bs):
@@ -1115,7 +1177,6 @@ def decode_predictions(preds, strides, conf_thr=0.25, img_size=640, anchors=None
             out_per_im[b] = torch.cat(out_per_im[b], dim=0)
         else:
             out_per_im[b] = torch.zeros((0, 6), device=device)
-
     return out_per_im
 
 def nms_axis_aligned(dets: torch.Tensor, iou_thr=0.5, topk=100):
@@ -1257,13 +1318,13 @@ def train(args):
     model = DualYoloV8L(num_classes=len(CANONICAL_CLASSES)).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
-    criterion = YoloLoss(model.anchors, len(CANONICAL_CLASSES), img_size=args.imgsz)
+    criterion = YoloLoss(len(CANONICAL_CLASSES), reg_max=16)
 
     best_map = 0.0
     for epoch in range(1, args.epochs+1):
         model.train()
         t0 = time.time()
-        loss_meter = 0.0; meter = {"l_box":0.0,"l_obj":0.0,"l_cls":0.0}
+        loss_meter = 0.0; meter = {"l_box":0.0,"l_cls":0.0,"l_dfl":0.0}
         nb = 0
         for rgbs, irs, targets, names in train_loader:
             rgbs = rgbs.to(device, non_blocking=True if device.type=='cuda' else False)
@@ -1285,7 +1346,7 @@ def train(args):
         dt = time.time()-t0
         loss_meter /= max(nb,1)
         for k in meter: meter[k] /= max(nb,1)
-        logger.info(f"Epoch {epoch}/{args.epochs} | loss={loss_meter:.4f} (box {meter['l_box']:.2f} obj {meter['l_obj']:.2f} cls {meter['l_cls']:.2f}) | {dt:.1f}s")
+        logger.info(f"Epoch {epoch}/{args.epochs} | loss={loss_meter:.4f} (box {meter['l_box']:.2f} cls {meter['l_cls']:.2f} dfl {meter['l_dfl']:.2f}) | {dt:.1f}s")
 
         # ---- Evaluation (从第20个epoch开始) ----
         if epoch >= 20:
@@ -1295,7 +1356,7 @@ def train(args):
                 for rgbs, irs, targets, names in val_loader:
                     rgbs = rgbs.to(device); irs = irs.to(device)
                     outs = model(rgbs, irs)
-                    dets = decode_predictions(outs, model.strides, conf_thr=args.conf_thres, img_size=args.imgsz, anchors=model.anchors)
+                    dets = decode_predictions(outs, model.strides, conf_thr=args.conf_thres, img_size=args.imgsz, reg_max=16)
                     dets = [nms_axis_aligned(d, iou_thr=args.nms_iou) for d in dets]
                     preds_all.extend(dets)
                     for t in targets:
@@ -1346,7 +1407,7 @@ def get_args():
     ap.add_argument("--lr",        type=float, default=1e-3)
     ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
-    ap.add_argument("--logdir",    type=str, default="./runs/1225_dualone")
+    ap.add_argument("--logdir",    type=str, default="./runs/1226_free2")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
     ap.add_argument("--max_det",       type=int, default=100)
