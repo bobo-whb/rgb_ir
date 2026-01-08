@@ -726,6 +726,7 @@ class BackboneV8Large(nn.Module):
         )
         self.layer4 = nn.Sequential(
             ConvBNAct(512, 1024, 3, 2),     # 40 -> 20
+            C2f(1024, 1024, n=3, shortcut=True),
             SPPF(1024, 1024, k=5)
         )
 
@@ -735,6 +736,43 @@ class BackboneV8Large(nn.Module):
         P4 = self.layer3(P3)  # 1/16, 512 ch
         P5 = self.layer4(P4)  # 1/32, 1024 ch
         return P3, P4, P5
+
+class YoloV8NeckSingle(nn.Module):
+    """
+    传统 YOLOv8-L 单模态颈部（FPN + PAN），输出与官方一致的三尺度特征：
+      - 输入: P3(256), P4(512), P5(1024)
+      - 输出: N3(256), N4(512), N5(1024)
+    """
+    def __init__(self, C3=256, C4=512, C5=1024):
+        super().__init__()
+        # 侧连降通道
+        self.lat5 = ConvBNAct(C5, 512, 1, 1)
+        self.lat4 = ConvBNAct(C4, 512, 1, 1)
+        self.lat3 = ConvBNAct(C3, 256, 1, 1)
+
+        # Top-down FPN
+        self.fpn_p4 = C2f(512 + 512, 512, n=3, shortcut=True)
+        self.fpn_p3 = C2f(256 + 512, 256, n=3, shortcut=True)
+
+        # Bottom-up PAN
+        self.pan_p4_down = ConvBNAct(256, 256, 3, 2)
+        self.pan_p4 = C2f(256 + 512, 512, n=3, shortcut=True)
+        self.pan_p5_down = ConvBNAct(512, 512, 3, 2)
+        self.pan_p5 = C2f(512 + 512, 1024, n=3, shortcut=True)
+
+    def forward(self, feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
+        p3, p4, p5 = feats  # 来自主干
+
+        # Top-down
+        p5_lat = self.lat5(p5)                         # 512
+        p4_td = self.fpn_p4(torch.cat([self.lat4(p4), F.interpolate(p5_lat, scale_factor=2.0, mode="nearest")], dim=1))
+        p3_td = self.fpn_p3(torch.cat([self.lat3(p3), F.interpolate(p4_td, scale_factor=2.0, mode="nearest")], dim=1))
+
+        # Bottom-up
+        p4_bu = self.pan_p4(torch.cat([self.pan_p4_down(p3_td), p4_td], dim=1))      # 512
+        p5_bu = self.pan_p5(torch.cat([self.pan_p5_down(p4_bu), p5_lat], dim=1))     # 1024
+
+        return p3_td, p4_bu, p5_bu
     
 class XAttnGate(nn.Module):
     """
@@ -833,10 +871,11 @@ class XAttnGate(nn.Module):
 
 class DualFusionNeckXAttnL(nn.Module):
     """
-    L 规模三路融合颈部：
+    L 规模三路融合颈部（带 PAN 压缩）：
       - lateral 统一到 512
-      - smooth 用 C2f(512->512)
-      - F3/F4/F5 目标通道 = 256 / 512 / 1024
+      - top-down FPN 平滑
+      - 融合后通道压缩为 256
+      - 追加自底向上 PAN 路径（P3→P4→P5），输出三层均 256 通道
     """
     def __init__(self, C3c=256, C4c=512, C5c=1024,
                  gate_mode: str = "channel",  # 或 'scalar'
@@ -875,6 +914,17 @@ class DualFusionNeckXAttnL(nn.Module):
         self.gate4 = XAttnGate(C4c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
         self.gate3 = XAttnGate(C3c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
 
+        # 通道压缩到 256，便于最终检测头
+        self.out5 = ConvBNAct(C5c, 256, 1, 1)
+        self.out4 = ConvBNAct(C4c, 256, 1, 1)
+        self.out3 = ConvBNAct(C3c, 256, 1, 1)
+
+        # 自底向上 PAN：在融合前、保持 512 通道做尺度交互
+        self.pan_down4 = ConvBNAct(512, 512, 3, 2)             # P3 -> stride2
+        self.pan_c4 = C2f(512 + 512, 512, n=3, shortcut=True)  # concat P3ds + P4
+        self.pan_down5 = ConvBNAct(512, 512, 3, 2)             # P4' -> stride2
+        self.pan_c5 = C2f(512 + 512, 512, n=3, shortcut=True)  # concat P4'ds + P5
+
     def forward(self, rgb_feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
                       ir_feats:  Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
         r3, r4, r5 = rgb_feats
@@ -892,17 +942,24 @@ class DualFusionNeckXAttnL(nn.Module):
         p4_i = self.smooth4(I4 + F.interpolate(I5, scale_factor=2.0, mode="nearest"))
         p3_i = self.smooth3(I3 + F.interpolate(p4_i, scale_factor=2.0, mode="nearest"))
 
+        # 自底向上 PAN（在融合前，保持模态独立）
+        p4_bu = self.pan_c4(torch.cat([self.pan_down4(p3), p4], dim=1))
+        p5_bu = self.pan_c5(torch.cat([self.pan_down5(p4_bu), R5], dim=1))
+
+        p4_bu_i = self.pan_c4(torch.cat([self.pan_down4(p3_i), p4_i], dim=1))
+        p5_bu_i = self.pan_c5(torch.cat([self.pan_down5(p4_bu_i), I5], dim=1))
+
         # F5
-        r5_m = self.rgb_mlp5(R5)
-        i5_m = self.ir_mlp5(I5)
-        c5_m = self.fuse5(self.cat_mlp5(torch.cat([R5, I5], dim=1)))
+        r5_m = self.rgb_mlp5(p5_bu)
+        i5_m = self.ir_mlp5(p5_bu_i)
+        c5_m = self.fuse5(self.cat_mlp5(torch.cat([p5_bu, p5_bu_i], dim=1)))
         w5 = self.gate5(r5_m, i5_m, c5_m)
         F5 = r5_m * w5[0] + i5_m * w5[1] + c5_m * w5[2]
 
         # F4
-        r4_m = self.rgb_mlp4(p4)
-        i4_m = self.ir_mlp4(p4_i)
-        c4_m = self.fuse4(self.cat_mlp4(torch.cat([p4, p4_i], dim=1)))
+        r4_m = self.rgb_mlp4(p4_bu)
+        i4_m = self.ir_mlp4(p4_bu_i)
+        c4_m = self.fuse4(self.cat_mlp4(torch.cat([p4_bu, p4_bu_i], dim=1)))
         w4 = self.gate4(r4_m, i4_m, c4_m)
         F4 = r4_m * w4[0] + i4_m * w4[1] + c4_m * w4[2]
 
@@ -913,7 +970,12 @@ class DualFusionNeckXAttnL(nn.Module):
         w3 = self.gate3(r3_m, i3_m, c3_m)
         F3 = r3_m * w3[0] + i3_m * w3[1] + c3_m * w3[2]
 
-        return F3, F4, F5
+        # 通道压缩
+        P3 = self.out3(F3)   # 256
+        P4 = self.out4(F4)   # 256
+        P5 = self.out5(F5)   # 256
+
+        return P3, P4, P5
 
 class DetectHead(nn.Module):
     """
@@ -921,11 +983,18 @@ class DetectHead(nn.Module):
       - reg 分支输出 4*(reg_max+1) 的离散距离分布
       - cls 分支输出 nc 类概率（无 obj 分支）
     """
-    def __init__(self, nc: int, ch: List[int], reg_max: int = 16):
+    def __init__(self, nc: int, ch: List[int], reg_max: int = 16,
+                 strides=(8, 16, 32), img_size: int = 640):
         super().__init__()
         self.nc = nc
         self.reg_max = reg_max
         self.nl = len(ch)
+        self.img_size = img_size
+        self.strides = list(strides)
+
+        # DFL integral (distribution -> distance expectation)
+        self.register_buffer("dfl_proj", torch.arange(reg_max + 1, dtype=torch.float32).view(1, 1, reg_max + 1, 1, 1),
+                             persistent=False)
 
         self.stems = nn.ModuleList([ConvBNAct(c, c, k=1, s=1) for c in ch])
         self.cls_conv = nn.ModuleList([nn.Sequential(
@@ -940,6 +1009,8 @@ class DetectHead(nn.Module):
         self.cls_pred = nn.ModuleList([nn.Conv2d(c, nc, 1) for c in ch])
         self.reg_pred = nn.ModuleList([nn.Conv2d(c, 4 * (reg_max + 1), 1) for c in ch])
 
+        self._bias_init()
+
     def forward(self, feats: List[torch.Tensor]):
         outputs = []
         for i, x in enumerate(feats):
@@ -948,8 +1019,108 @@ class DetectHead(nn.Module):
             reg_feat = self.reg_conv[i](x)
             cls_out = self.cls_pred[i](cls_feat)          # (B, nc, H, W)
             reg_out = self.reg_pred[i](reg_feat)          # (B, 4*(reg_max+1), H, W)
-            outputs.append((reg_out, cls_out))
+            # Ultralytics-like: merge per-level outputs to a single tensor
+            # (B, nc + 4*(reg_max+1), H, W)
+            outputs.append(torch.cat([reg_out, cls_out], dim=1))
         return outputs
+
+    def _bias_init(self, prior_prob: float = 0.01):
+        """
+        Ultralytics-style bias init:
+          - cls bias set for low foreground prior and scale-aware (depends on stride & img_size)
+          - reg bias gently positive to help optimization stability
+        """
+        import math
+
+        for i in range(self.nl):
+            # classification bias: encourage low initial confidence
+            # scale-aware term similar to YOLOv5/8 practice
+            stride = float(self.strides[i]) if i < len(self.strides) else 8.0 * (2 ** i)
+            # approximate number of locations per image at this level
+            nloc = (self.img_size / stride) ** 2
+            # 5 positives per image heuristic (common practice)
+            cls_bias = math.log(5.0 / max(self.nc, 1) / max(nloc, 1.0))
+            nn.init.constant_(self.cls_pred[i].bias, cls_bias)
+
+            # regression bias: small positive value
+            nn.init.constant_(self.reg_pred[i].bias, 1.0)
+
+    def dfl_integral(self, reg_out: torch.Tensor) -> torch.Tensor:
+        """
+        reg_out: (B, 4*(reg_max+1), H, W) logits
+        returns: (B, 4, H, W) distances (in bins, not multiplied by stride)
+        """
+        B, _, H, W = reg_out.shape
+        x = reg_out.view(B, 4, self.reg_max + 1, H, W)
+        x = x.softmax(2)
+        # expectation over bins
+        dist = (x * self.dfl_proj.to(x.dtype)).sum(2)
+        return dist
+
+    def decode(self, preds: List[torch.Tensor], conf_thr: float = 0.25) -> torch.Tensor:
+        """
+        Decode merged head outputs to a unified prediction tensor:
+          preds: list of (B, nc + 4*(reg_max+1), H, W)
+        returns:
+          y: (B, N, 4 + nc) where boxes are xyxy in input-pixel coordinates
+        """
+        device = preds[0].device
+        bs = preds[0].shape[0]
+        out = []
+        reg_ch = 4 * (self.reg_max + 1)
+
+        for i, p in enumerate(preds):
+            reg_out = p[:, :reg_ch]
+            cls_out = p[:, reg_ch:]
+            _, _, H, W = cls_out.shape
+            stride = self.strides[i]
+
+            # grid centers in pixels
+            gy, gx = torch.meshgrid(
+                torch.arange(H, device=device),
+                torch.arange(W, device=device),
+                indexing="ij"
+            )
+            cx = (gx + 0.5) * stride
+            cy = (gy + 0.5) * stride
+            cx = cx.view(-1)
+            cy = cy.view(-1)
+
+            # DFL integral -> distances (pixels)
+            dist = self.dfl_integral(reg_out) * stride  # (B,4,H,W)
+            dist = dist.permute(0, 2, 3, 1).reshape(bs, -1, 4)  # (B, HW, 4)
+
+            x1 = cx[None, :] - dist[:, :, 0]
+            y1 = cy[None, :] - dist[:, :, 1]
+            x2 = cx[None, :] + dist[:, :, 2]
+            y2 = cy[None, :] + dist[:, :, 3]
+            boxes = torch.stack([x1, y1, x2, y2], dim=-1)  # (B, HW, 4)
+
+            cls = cls_out.permute(0, 2, 3, 1).reshape(bs, -1, self.nc).sigmoid()  # (B, HW, nc)
+            out.append(torch.cat([boxes, cls], dim=-1))  # (B, HW, 4+nc)
+
+        y = torch.cat(out, dim=1)  # (B, N, 4+nc)
+        return y
+
+    def decode_dets(self, preds: List[torch.Tensor], conf_thr: float = 0.25) -> List[torch.Tensor]:
+        """
+        Decode merged head outputs to per-image detections:
+          returns List[Tensor(N,6)] with columns [x1,y1,x2,y2,conf,cls]
+        """
+        y = self.decode(preds, conf_thr=0.0)  # (B, N, 4+nc)
+        bs = y.shape[0]
+        dets = []
+        for b in range(bs):
+            boxes = y[b, :, :4]
+            cls_prob = y[b, :, 4:]
+            conf, cls_id = cls_prob.max(dim=-1)
+            mask = conf > conf_thr
+            if mask.any():
+                det = torch.cat([boxes[mask], conf[mask].unsqueeze(1), cls_id[mask].float().unsqueeze(1)], dim=1)
+            else:
+                det = torch.zeros((0, 6), device=y.device)
+            dets.append(det)
+        return dets
 
 class YoloLoss(nn.Module):
     """
@@ -999,7 +1170,7 @@ class YoloLoss(nn.Module):
         return ce * alpha_t * ((1 - p_t) ** gamma)
 
     def forward(self, preds, targets, strides, device=None):
-        device = preds[0][0].device
+        device = preds[0].device
         bs = len(targets)
         total_box = torch.zeros(1, device=device)
         total_cls = torch.zeros(1, device=device)
@@ -1009,11 +1180,17 @@ class YoloLoss(nn.Module):
             tboxes = targets[b]["boxes"].to(device)
             tcls   = targets[b]["labels"].to(device)
             if tboxes.numel() == 0:
-                for _, cls_out in preds:
-                    total_cls += F.binary_cross_entropy_with_logits(cls_out[b], torch.zeros_like(cls_out[b]), reduction="sum")
+                # preds: list of (B, 4*(reg_max+1)+nc, H, W)
+                reg_ch = 4 * (self.reg_max + 1)
+                for p in preds:
+                    cls_out = p[:, reg_ch:][b]
+                    total_cls += F.binary_cross_entropy_with_logits(cls_out, torch.zeros_like(cls_out), reduction="sum")
                 continue
 
-            for l, (reg_out, cls_out) in enumerate(preds):
+            reg_ch = 4 * (self.reg_max + 1)
+            for l, p in enumerate(preds):
+                reg_out = p[:, :reg_ch]
+                cls_out = p[:, reg_ch:]
                 stride = strides[l]
                 _, _, h, w = cls_out.shape
                 gy, gx = torch.meshgrid(
@@ -1100,40 +1277,53 @@ class YoloLoss(nn.Module):
         return loss, {"l_box": total_box.item(), "l_cls": total_cls.item(), "l_dfl": total_dfl.item()}
 
 class DualYoloV8L(nn.Module):
-    def __init__(self, num_classes: int):
+    def __init__(self, num_classes: int, imgsz: int = 640):
         super().__init__()
         self.rgb_backbone = BackboneV8Large(3)
         self.ir_backbone  = BackboneV8Large(3)
 
+        # 独立的 YOLOv8-L 颈部（参数不共享）
+        self.rgb_neck = YoloV8NeckSingle(C3=256, C4=512, C5=1024)
+        self.ir_neck  = YoloV8NeckSingle(C3=256, C4=512, C5=1024)
+
         # 注意: d_model 可设 96/128；'scalar' 更省显存，'channel' 表达力更强
-        self.neck = DualFusionNeckXAttnL(
+        self.fusion_neck = DualFusionNeckXAttnL(
             C3c=256, C4c=512, C5c=1024,
             gate_mode='channel',
             d_model=96,
             reduction=16
         )
 
-        # anchor-free 检测头
-        self.detect = DetectHead(num_classes, ch=[256, 512, 1024], reg_max=16)
         self.strides = [8, 16, 32]
+        # anchor-free 检测头（PAN 后统一 256 通道）
+        self.detect = DetectHead(num_classes, ch=[256, 256, 256], reg_max=16, strides=self.strides, img_size=imgsz)
 
     def forward(self, rgb, ir):
+        # 双模态各自独立的 backbone + neck
         r3, r4, r5 = self.rgb_backbone(rgb)
         i3, i4, i5 = self.ir_backbone(ir)
-        F3, F4, F5 = self.neck((r3, r4, r5), (i3, i4, i5))
+
+        r_feats = self.rgb_neck((r3, r4, r5))
+        i_feats = self.ir_neck((i3, i4, i5))
+
+        # 融合颈部在 neck 输出处进行跨模态门控
+        F3, F4, F5 = self.fusion_neck(r_feats, i_feats)
         outs = self.detect([F3, F4, F5])
         return outs
 
 def decode_predictions(preds, strides, conf_thr=0.25, img_size=640, reg_max=16):
     """
-    Anchor-free 解码：preds: List[(reg_out, cls_out)] per level
+    Anchor-free 解码：preds: List[(B, 4*(reg_max+1)+nc, H, W)] per level
     返回 [B] -> (N,6) [x1,y1,x2,y2,conf,cls]
     """
-    device = preds[0][0].device
-    bs = preds[0][0].shape[0]
+    device = preds[0].device
+    bs = preds[0].shape[0]
     out_per_im = [[] for _ in range(bs)]
+    reg_ch = 4 * (reg_max + 1)
 
-    for l, (reg_out, cls_out) in enumerate(preds):
+    for l, p in enumerate(preds):
+        reg_out = p[:, :reg_ch]
+        cls_out = p[:, reg_ch:]
         B, _, H, W = cls_out.shape
         stride = strides[l]
         # 构造网格中心
@@ -1315,10 +1505,49 @@ def train(args):
                               collate_fn=collate_fn, pin_memory=True if device.type=='cuda' else False)
 
     # Model
-    model = DualYoloV8L(num_classes=len(CANONICAL_CLASSES)).to(device)
+    model = DualYoloV8L(num_classes=len(CANONICAL_CLASSES), imgsz=args.imgsz).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
     criterion = YoloLoss(len(CANONICAL_CLASSES), reg_max=16)
+
+    # ---------- 自动批大小估计，尽量吃满显存但不 OOM ----------
+    if device.type == "cuda" and args.auto_batch:
+        torch.cuda.empty_cache()
+        try:
+            free_mem, total_mem = torch.cuda.mem_get_info(device)
+            logger.info(f"Auto batch | free={free_mem/1024**3:.2f} GiB total={total_mem/1024**3:.2f} GiB, target frac={args.max_vram_frac}")
+
+            sample_rgb, sample_ir, sample_tgt, _ = train_ds[0]
+            base_b = max(1, min(args.batch, 4))
+            rgb_b = sample_rgb.unsqueeze(0).repeat(base_b, 1, 1, 1).to(device)
+            ir_b  = sample_ir.unsqueeze(0).repeat(base_b, 1, 1, 1).to(device)
+            tgt_b = []
+            for _ in range(base_b):
+                tgt_b.append({
+                    "boxes": sample_tgt["boxes"].to(device),
+                    "labels": sample_tgt["labels"].to(device),
+                    "orig_size": sample_tgt["orig_size"].to(device),
+                })
+
+            model.train()
+            optim.zero_grad(set_to_none=True)
+            torch.cuda.reset_peak_memory_stats(device)
+            out_tmp = model(rgb_b, ir_b)
+            loss_tmp, _ = criterion(out_tmp, tgt_b, model.strides)
+            loss_tmp.backward()
+            peak = torch.cuda.max_memory_allocated(device)
+            mem_per_sample = peak / base_b
+            torch.cuda.empty_cache()
+
+            target_mem = total_mem * args.max_vram_frac
+            est_batch = int(target_mem // max(mem_per_sample, 1))
+            est_batch = max(1, est_batch)
+            est_batch = min(est_batch, args.batch * 3)  # 避免倍数过大
+            logger.info(f"Auto batch | peak={peak/1024**3:.2f} GiB for {base_b} -> {mem_per_sample/1024**3:.3f} GiB/sample, suggested batch={est_batch}")
+            args.batch = est_batch
+        except Exception as e:
+            logger.warning(f"Auto batch failed: {e}. 使用用户设定 batch={args.batch}")
+            torch.cuda.empty_cache()
 
     best_map = 0.0
     for epoch in range(1, args.epochs+1):
@@ -1356,7 +1585,7 @@ def train(args):
                 for rgbs, irs, targets, names in val_loader:
                     rgbs = rgbs.to(device); irs = irs.to(device)
                     outs = model(rgbs, irs)
-                    dets = decode_predictions(outs, model.strides, conf_thr=args.conf_thres, img_size=args.imgsz, reg_max=16)
+                    dets = model.detect.decode_dets(outs, conf_thr=args.conf_thres)
                     dets = [nms_axis_aligned(d, iou_thr=args.nms_iou) for d in dets]
                     preds_all.extend(dets)
                     for t in targets:
@@ -1402,15 +1631,17 @@ def get_args():
     ap.add_argument("--val_csv",   type=str, default="../LLVIP/llvip_test_paths.csv")
     ap.add_argument("--imgsz",     type=int, default=640)
     ap.add_argument("--epochs",    type=int, default=100)
-    ap.add_argument("--batch",     type=int, default=8)
+    ap.add_argument("--batch",     type=int, default=7)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--lr",        type=float, default=1e-3)
     ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
-    ap.add_argument("--logdir",    type=str, default="./runs/1226_free2")
+    ap.add_argument("--logdir",    type=str, default="./runs/0105_rm")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
     ap.add_argument("--max_det",       type=int, default=100)
+    ap.add_argument("--auto_batch", action="store_true", help="自动估算批大小以尽量占满显存")
+    ap.add_argument("--max_vram_frac", type=float, default=0.9, help="自动批大小的目标显存占用比例 (0-1)")
     return ap.parse_args()
 
 if __name__ == "__main__":
