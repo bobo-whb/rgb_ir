@@ -14,7 +14,10 @@ import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 try:
     import pandas as pd
@@ -23,15 +26,47 @@ except Exception:
     HAS_PANDAS = False
 
 # -------- Logging --------
-def setup_logger(log_file: str):
+def setup_logger(log_file: str, *, is_main: bool = True):
     logger = logging.getLogger("train")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-    sh = logging.StreamHandler(sys.stdout); sh.setFormatter(fmt)
     fh = logging.FileHandler(log_file, encoding="utf-8"); fh.setFormatter(fmt)
-    logger.addHandler(sh); logger.addHandler(fh)
+    logger.addHandler(fh)
+    if is_main:
+        sh = logging.StreamHandler(sys.stdout); sh.setFormatter(fmt)
+        logger.addHandler(sh)
     return logger
+
+def is_dist_avail_and_initialized() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+def get_rank() -> int:
+    return dist.get_rank() if is_dist_avail_and_initialized() else 0
+
+def get_world_size() -> int:
+    return dist.get_world_size() if is_dist_avail_and_initialized() else 1
+
+def is_main_process() -> bool:
+    return get_rank() == 0
+
+def unwrap_model(model: nn.Module) -> nn.Module:
+    return model.module if hasattr(model, "module") else model
+
+def parse_gpus_arg(gpus: str) -> List[int]:
+    """
+    解析 `--gpus 0,1,2` 形式的参数。
+    返回空列表表示未启用（走 --gpu 单卡或 CPU）。
+    """
+    if not gpus:
+        return []
+    out: List[int] = []
+    for x in gpus.split(","):
+        x = x.strip()
+        if x == "":
+            continue
+        out.append(int(x))
+    return out
 
 # -------- Class alias mapping --------
 ALIAS_MAP: Dict[str, Optional[str]] = {
@@ -372,10 +407,14 @@ def parse_shared_xml(xml_path: str) -> Tuple[List[List[float]], List[int]]:
 
 class RGBIRDetDataset(Dataset):
     def __init__(self, csv_path: str, imgsz: int = 640, augment: bool = True,
-                 mosaic: bool = True, mosaic_prob: float = 0.8, mixup_prob: float = 0.15,
+                 # ---- Augment defaults aligned to YOLOv8 ----
+                 mosaic: bool = True, mosaic_prob: float = 1.0, mixup_prob: float = 0.0,
                  mosaic_scale: Tuple[float, float] = (0.5, 1.5),
                  hsv_gain: Tuple[float, float, float] = (0.015, 0.7, 0.4),
-                 spectral_prob: float = 0.5, spectral_strength: float = 0.2,
+                 degrees: float = 0.0, translate: float = 0.1, scale: float = 0.5,
+                 shear: float = 0.0, perspective: float = 0.0,
+                 # project-specific spectral mixing (disabled by default to match YOLOv8)
+                 spectral_prob: float = 0.0, spectral_strength: float = 0.0,
                  hflip_prob: float = 0.5, vflip_prob: float = 0.0):
         super().__init__()
         self.items = read_csv(csv_path)
@@ -389,6 +428,12 @@ class RGBIRDetDataset(Dataset):
             lo, hi = hi, lo
         self.mosaic_scale = (max(lo, 0.1), max(hi, 0.1))
         self.hsv_gain = hsv_gain
+        # random perspective (Ultralytics/YOLOv8-style)
+        self.degrees = float(degrees)
+        self.translate = float(translate)
+        self.scale = float(scale)
+        self.shear = float(shear)
+        self.perspective = float(perspective)
         self.spectral_prob = spectral_prob
         self.spectral_strength = max(spectral_strength, 0.0)
         self.hflip_prob = max(min(hflip_prob, 1.0), 0.0)
@@ -436,12 +481,34 @@ class RGBIRDetDataset(Dataset):
         else:
             boxes_scaled = boxes_np
 
-        rgb_t = torch.from_numpy(np.array(rgb)).permute(2,0,1).float()/255.0
-        ir_t  = torch.from_numpy(np.array(ir )).permute(2,0,1).float()/255.0
+        # ---- Apply YOLOv8-like augmentations after letterbox (same transform for RGB/IR) ----
+        if self.augment:
+            rgb_np2 = np.array(rgb, dtype=np.uint8)
+            ir_np2  = np.array(ir,  dtype=np.uint8)
+            boxes_scaled = boxes_scaled.astype(np.float32) if boxes_scaled is not None else np.zeros((0, 4), np.float32)
+
+            rgb_np2, ir_np2, boxes_scaled, labels_np = self._random_perspective_np(
+                rgb_np2, ir_np2, boxes_scaled, labels_np,
+                degrees=self.degrees, translate=self.translate, scale=self.scale,
+                shear=self.shear, perspective=self.perspective,
+            )
+            rgb_np2, ir_np2, boxes_scaled = self._random_flip_np(rgb_np2, ir_np2, boxes_scaled)
+            rgb_np2, ir_np2 = self._apply_hsv(rgb_np2, ir_np2)
+            rgb_np2, ir_np2 = self._spectral_augment(rgb_np2, ir_np2)
+
+            rgb_t = torch.from_numpy(rgb_np2).permute(2, 0, 1).float() / 255.0
+            ir_t  = torch.from_numpy(ir_np2 ).permute(2, 0, 1).float() / 255.0
+            boxes_final = boxes_scaled
+            labels_final = labels_np
+        else:
+            rgb_t = torch.from_numpy(np.array(rgb)).permute(2,0,1).float()/255.0
+            ir_t  = torch.from_numpy(np.array(ir )).permute(2,0,1).float()/255.0
+            boxes_final = boxes_scaled
+            labels_final = labels_np
 
         target = {
-            "boxes": torch.from_numpy(boxes_scaled),
-            "labels": torch.from_numpy(labels_np),
+            "boxes": torch.from_numpy(boxes_final),
+            "labels": torch.from_numpy(labels_final),
             "orig_size": torch.tensor([rgb.size[1], rgb.size[0]], dtype=torch.float32)
         }
         return rgb_t, ir_t, target, os.path.basename(rgb_path)
@@ -455,9 +522,6 @@ class RGBIRDetDataset(Dataset):
                 rgb, ir, boxes, labels = self._mixup_samples(rgb, ir, boxes, labels, rgb2, ir2, boxes2, labels2)
         else:
             rgb, ir, boxes, labels = self._load_sample_numpy(idx)
-            rgb, ir, boxes = self._random_flip_np(rgb, ir, boxes)
-        rgb, ir = self._apply_hsv(rgb, ir)
-        rgb, ir = self._spectral_augment(rgb, ir)
         return rgb, ir, boxes, labels
 
     def _mixup_samples(self, rgb1, ir1, boxes1, labels1, rgb2, ir2, boxes2, labels2):
@@ -524,6 +588,103 @@ class RGBIRDetDataset(Dataset):
         ir_f = ir.astype(np.float32)
         rgb_mix = np.clip(rgb_f * (1.0 - alpha) + ir_f * alpha, 0, 255).astype(np.uint8)
         return rgb_mix, ir
+
+    def _random_perspective_np(self, rgb, ir, boxes, labels=None,
+                               degrees=0.0, translate=0.1, scale=0.5, shear=0.0, perspective=0.0,
+                               border=(0, 0)):
+        """
+        Ultralytics/YOLOv8-style random perspective/affine.
+        Applies identical transform to RGB/IR and updates axis-aligned xyxy boxes.
+        """
+        if boxes is None:
+            boxes = np.zeros((0, 4), dtype=np.float32)
+        if labels is None:
+            labels = np.zeros((boxes.shape[0],), dtype=np.int64)
+
+        h0, w0 = rgb.shape[:2]
+        assert ir.shape[:2] == (h0, w0), "RGB/IR size mismatch"
+
+        # Output size (with optional border, kept at imgsz by default)
+        height = h0 + border[1] * 2
+        width = w0 + border[0] * 2
+
+        # Identity if no aug
+        if degrees == 0 and translate == 0 and scale == 0 and shear == 0 and perspective == 0:
+            return rgb, ir, boxes, labels
+
+        # Center
+        C = np.eye(3, dtype=np.float32)
+        C[0, 2] = -w0 / 2
+        C[1, 2] = -h0 / 2
+
+        # Perspective
+        P = np.eye(3, dtype=np.float32)
+        P[2, 0] = random.uniform(-perspective, perspective)
+        P[2, 1] = random.uniform(-perspective, perspective)
+
+        # Rotation and Scale
+        R = np.eye(3, dtype=np.float32)
+        a = random.uniform(-degrees, degrees)
+        s = random.uniform(1 - scale, 1 + scale)
+        if abs(a) > 1e-3 or abs(s - 1.0) > 1e-3:
+            M2 = cv2.getRotationMatrix2D(center=(0, 0), angle=a, scale=s)  # 2x3
+            R[:2, :] = M2
+        # Shear
+        S = np.eye(3, dtype=np.float32)
+        if shear != 0:
+            sx = math.tan(random.uniform(-shear, shear) * math.pi / 180)
+            sy = math.tan(random.uniform(-shear, shear) * math.pi / 180)
+            S[0, 1] = sx
+            S[1, 0] = sy
+
+        # Translation
+        T = np.eye(3, dtype=np.float32)
+        T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width
+        T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height
+
+        # Combined matrix
+        M = T @ S @ R @ P @ C  # 3x3
+
+        border_val = (114, 114, 114)
+        if perspective:
+            rgb_t = cv2.warpPerspective(rgb, M, dsize=(width, height), borderValue=border_val)
+            ir_t  = cv2.warpPerspective(ir,  M, dsize=(width, height), borderValue=border_val)
+        else:
+            rgb_t = cv2.warpAffine(rgb, M[:2], dsize=(width, height), borderValue=border_val)
+            ir_t  = cv2.warpAffine(ir,  M[:2], dsize=(width, height), borderValue=border_val)
+
+        if boxes.shape[0] == 0:
+            return rgb_t, ir_t, boxes, labels
+
+        # Transform boxes (x1y1, x2y1, x2y2, x1y2)
+        n = boxes.shape[0]
+        corners = boxes[:, [0, 1, 2, 1, 2, 3, 0, 3]].reshape(n * 4, 2)
+        ones = np.ones((n * 4, 1), dtype=np.float32)
+        xy1 = np.concatenate([corners, ones], axis=1)  # (n*4,3)
+        xy = xy1 @ M.T
+        if perspective:
+            xy = xy[:, :2] / (xy[:, 2:3] + 1e-9)
+        else:
+            xy = xy[:, :2]
+        xy = xy.reshape(n, 4, 2)
+
+        new_boxes = np.concatenate([xy.min(axis=1), xy.max(axis=1)], axis=1)  # (n,4)
+        new_boxes[:, [0, 2]] = new_boxes[:, [0, 2]].clip(0, width)
+        new_boxes[:, [1, 3]] = new_boxes[:, [1, 3]].clip(0, height)
+
+        # Filter candidates (Ultralytics-style)
+        w = new_boxes[:, 2] - new_boxes[:, 0]
+        h = new_boxes[:, 3] - new_boxes[:, 1]
+        w0b = boxes[:, 2] - boxes[:, 0]
+        h0b = boxes[:, 3] - boxes[:, 1]
+        area = w * h
+        area0 = w0b * h0b + 1e-9
+        ar = np.maximum(w / (h + 1e-9), h / (w + 1e-9))
+        keep = (w > 2) & (h > 2) & (area / area0 > 0.1) & (ar < 20)
+        new_boxes = new_boxes[keep]
+        new_labels = labels[keep] if labels is not None else None
+
+        return rgb_t, ir_t, new_boxes.astype(np.float32), new_labels
 
     def _load_mosaic_sample(self, idx: int):
         indices = [idx] + [random.randrange(len(self.items)) for _ in range(3)]
@@ -706,7 +867,7 @@ class MLP(nn.Module):
 
 class BackboneV8Large(nn.Module):
     """
-    YOLOv8-L 风格主干：输出 P3(1/8,256), P4(1/16,512), P5(1/32,1024)
+    YOLOv8-L 风格主干：输出 P3(1/8,256), P4(1/16,512), P5(1/32,1024), P6(1/64,1024)
     深度更大（n=3/6/6），通道更宽（64/128/256/512/1024）
     """
     def __init__(self, in_ch: int = 3):
@@ -729,28 +890,37 @@ class BackboneV8Large(nn.Module):
             C2f(1024, 1024, n=3, shortcut=True),
             SPPF(1024, 1024, k=5)
         )
+        # 额外的 P6（1/64）：由 P5 继续下采样得到
+        # 这里保持通道数 1024（便于与现有检测头/融合模块对齐）
+        self.layer5 = nn.Sequential(
+            ConvBNAct(1024, 1024, 3, 2),    # 20 -> 10
+            C2f(1024, 1024, n=3, shortcut=True),
+        )
 
     def forward(self, x):
         x = self.layer1(x)
         P3 = self.layer2(x)   # 1/8,  256 ch
         P4 = self.layer3(P3)  # 1/16, 512 ch
         P5 = self.layer4(P4)  # 1/32, 1024 ch
-        return P3, P4, P5
+        P6 = self.layer5(P5)  # 1/64, 1024 ch
+        return P3, P4, P5, P6
 
 class YoloV8NeckSingle(nn.Module):
     """
-    传统 YOLOv8-L 单模态颈部（FPN + PAN），输出与官方一致的三尺度特征：
-      - 输入: P3(256), P4(512), P5(1024)
-      - 输出: N3(256), N4(512), N5(1024)
+    YOLOv8-L 风格单模态颈部（FPN + PAN），这里扩展为四尺度：
+      - 输入: P3(256), P4(512), P5(1024), P6(1024)
+      - 输出: N3(256), N4(512), N5(1024), N6(1024)
     """
-    def __init__(self, C3=256, C4=512, C5=1024):
+    def __init__(self, C3=256, C4=512, C5=1024, C6=1024):
         super().__init__()
         # 侧连降通道
+        self.lat6 = ConvBNAct(C6, 1024, 1, 1)
         self.lat5 = ConvBNAct(C5, 512, 1, 1)
         self.lat4 = ConvBNAct(C4, 512, 1, 1)
         self.lat3 = ConvBNAct(C3, 256, 1, 1)
 
         # Top-down FPN
+        self.fpn_p5 = C2f(512 + 1024, 512, n=3, shortcut=True)
         self.fpn_p4 = C2f(512 + 512, 512, n=3, shortcut=True)
         self.fpn_p3 = C2f(256 + 512, 256, n=3, shortcut=True)
 
@@ -759,20 +929,24 @@ class YoloV8NeckSingle(nn.Module):
         self.pan_p4 = C2f(256 + 512, 512, n=3, shortcut=True)
         self.pan_p5_down = ConvBNAct(512, 512, 3, 2)
         self.pan_p5 = C2f(512 + 512, 1024, n=3, shortcut=True)
+        self.pan_p6_down = ConvBNAct(1024, 1024, 3, 2)
+        self.pan_p6 = C2f(1024 + 1024, 1024, n=3, shortcut=True)
 
-    def forward(self, feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
-        p3, p4, p5 = feats  # 来自主干
+    def forward(self, feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]):
+        p3, p4, p5, p6 = feats  # 来自主干
 
         # Top-down
-        p5_lat = self.lat5(p5)                         # 512
-        p4_td = self.fpn_p4(torch.cat([self.lat4(p4), F.interpolate(p5_lat, scale_factor=2.0, mode="nearest")], dim=1))
+        p6_lat = self.lat6(p6)                         # 1024
+        p5_td = self.fpn_p5(torch.cat([self.lat5(p5), F.interpolate(p6_lat, scale_factor=2.0, mode="nearest")], dim=1))  # 512
+        p4_td = self.fpn_p4(torch.cat([self.lat4(p4), F.interpolate(p5_td, scale_factor=2.0, mode="nearest")], dim=1))
         p3_td = self.fpn_p3(torch.cat([self.lat3(p3), F.interpolate(p4_td, scale_factor=2.0, mode="nearest")], dim=1))
 
         # Bottom-up
         p4_bu = self.pan_p4(torch.cat([self.pan_p4_down(p3_td), p4_td], dim=1))      # 512
-        p5_bu = self.pan_p5(torch.cat([self.pan_p5_down(p4_bu), p5_lat], dim=1))     # 1024
+        p5_bu = self.pan_p5(torch.cat([self.pan_p5_down(p4_bu), p5_td], dim=1))      # 1024
+        p6_bu = self.pan_p6(torch.cat([self.pan_p6_down(p5_bu), p6_lat], dim=1))     # 1024
 
-        return p3_td, p4_bu, p5_bu
+        return p3_td, p4_bu, p5_bu, p6_bu
     
 class XAttnGate(nn.Module):
     """
@@ -871,83 +1045,107 @@ class XAttnGate(nn.Module):
 
 class DualFusionNeckXAttnL(nn.Module):
     """
-    L 规模三路融合颈部（带 PAN 压缩）：
-      - lateral 统一到 512
-      - top-down FPN 平滑
-      - 融合后通道压缩为 256
-      - 追加自底向上 PAN 路径（P3→P4→P5），输出三层均 256 通道
+    L 规模三路融合颈部（带 FPN + PAN，三路门控融合）：
+      - 维持原始四尺度通道 (P3/P4/P5/P6 = C3c/C4c/C5c/C6c)
+      - 仅在跨尺度交互处做“逐层对齐”（例如 P6->P5, P5->P4, P4->P3 的投影）
+      - 在融合前，RGB/IR 各自做 top-down + bottom-up（保持模态独立）
+      - 每个尺度构造 (RGB, IR, Concat) 三路候选特征，经注意力门控融合
+      - 输出四层通道分别为 (C3c, C4c, C5c, C6c)，供检测头直接使用
     """
-    def __init__(self, C3c=256, C4c=512, C5c=1024,
+    def __init__(self, C3c=256, C4c=512, C5c=1024, C6c=1024,
                  gate_mode: str = "channel",  # 或 'scalar'
                  d_model: int = 96,
                  reduction: int = 16):
         super().__init__()
-        # 侧连统一到 512
-        self.lat5 = ConvBNAct(C5c, 512, 1, 1)  # 1024 -> 512
-        self.lat4 = ConvBNAct(C4c, 512, 1, 1)  #  512 -> 512
-        self.lat3 = ConvBNAct(C3c, 512, 1, 1)  #  256 -> 512
+        # 逐层对齐：仅用于跨尺度相加/交互的通道投影
+        self.up6_to5 = ConvBNAct(C6c, C5c, 1, 1)  # P6(C6) -> P5(C5)
+        self.up5_to4 = ConvBNAct(C5c, C4c, 1, 1)  # P5(C5) -> P4(C4)
+        self.up4_to3 = ConvBNAct(C4c, C3c, 1, 1)  # P4(C4) -> P3(C3)
 
         # 顶到底 FPN 平滑
-        self.smooth4 = C2f(512, 512, n=3, shortcut=True)
-        self.smooth3 = C2f(512, 512, n=3, shortcut=True)
+        self.smooth5 = C2f(C5c, C5c, n=3, shortcut=True)
+        self.smooth4 = C2f(C4c, C4c, n=3, shortcut=True)
+        self.smooth3 = C2f(C3c, C3c, n=3, shortcut=True)
+
+        # ---------- F6（10x10） ----------
+        self.rgb_mlp6 = MLP(C6c, C6c, r=0.5)
+        self.ir_mlp6  = MLP(C6c, C6c, r=0.5)
+        self.cat_mlp6 = MLP(2 * C6c, 2 * C6c, r=0.5)
+        self.fuse6    = ConvBNAct(2 * C6c, C6c, 1, 1)
 
         # ---------- F5（20x20） ----------
-        self.rgb_mlp5 = MLP(512, C5c, r=0.5)        # 512 -> 1024
-        self.ir_mlp5  = MLP(512, C5c, r=0.5)        # 512 -> 1024
-        self.cat_mlp5 = MLP(1024, 1024, r=0.5)      # 512+512 -> 1024
-        self.fuse5    = ConvBNAct(1024, C5c, 1, 1)  # 1024 -> 1024
+        self.rgb_mlp5 = MLP(C5c, C5c, r=0.5)        # 1024 -> 1024
+        self.ir_mlp5  = MLP(C5c, C5c, r=0.5)
+        self.cat_mlp5 = MLP(2 * C5c, 2 * C5c, r=0.5)  # 1024+1024 -> 2048
+        self.fuse5    = ConvBNAct(2 * C5c, C5c, 1, 1)  # 2048 -> 1024
 
         # ---------- F4（40x40） ----------
-        self.rgb_mlp4 = MLP(512, C4c, r=0.5)        # 512 -> 512
-        self.ir_mlp4  = MLP(512, C4c, r=0.5)
-        self.cat_mlp4 = MLP(1024, 1024, r=0.5)
-        self.fuse4    = ConvBNAct(1024, C4c, 1, 1)  # 1024 -> 512
+        self.rgb_mlp4 = MLP(C4c, C4c, r=0.5)        # 512 -> 512
+        self.ir_mlp4  = MLP(C4c, C4c, r=0.5)
+        self.cat_mlp4 = MLP(2 * C4c, 2 * C4c, r=0.5)
+        self.fuse4    = ConvBNAct(2 * C4c, C4c, 1, 1)  # 1024 -> 512
 
         # ---------- F3（80x80） ----------
-        self.rgb_mlp3 = MLP(512, C3c, r=0.5)        # 512 -> 256
-        self.ir_mlp3  = MLP(512, C3c, r=0.5)
-        self.cat_mlp3 = MLP(1024, 1024, r=0.5)
-        self.fuse3    = ConvBNAct(1024, C3c, 1, 1)  # 1024 -> 256
+        self.rgb_mlp3 = MLP(C3c, C3c, r=0.5)        # 256 -> 256
+        self.ir_mlp3  = MLP(C3c, C3c, r=0.5)
+        self.cat_mlp3 = MLP(2 * C3c, 2 * C3c, r=0.5)  # 256+256 -> 512
+        self.fuse3    = ConvBNAct(2 * C3c, C3c, 1, 1)  # 512 -> 256
 
         # 跨模态注意力门控
+        self.gate6 = XAttnGate(C6c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
         self.gate5 = XAttnGate(C5c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
         self.gate4 = XAttnGate(C4c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
         self.gate3 = XAttnGate(C3c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
 
-        # 通道压缩到 256，便于最终检测头
-        self.out5 = ConvBNAct(C5c, 256, 1, 1)
-        self.out4 = ConvBNAct(C4c, 256, 1, 1)
-        self.out3 = ConvBNAct(C3c, 256, 1, 1)
+        # 输出整形（保持原通道数不变，便于后续检测头直接使用）
+        self.out6 = ConvBNAct(C6c, C6c, 1, 1)
+        self.out5 = ConvBNAct(C5c, C5c, 1, 1)
+        self.out4 = ConvBNAct(C4c, C4c, 1, 1)
+        self.out3 = ConvBNAct(C3c, C3c, 1, 1)
 
-        # 自底向上 PAN：在融合前、保持 512 通道做尺度交互
-        self.pan_down4 = ConvBNAct(512, 512, 3, 2)             # P3 -> stride2
-        self.pan_c4 = C2f(512 + 512, 512, n=3, shortcut=True)  # concat P3ds + P4
-        self.pan_down5 = ConvBNAct(512, 512, 3, 2)             # P4' -> stride2
-        self.pan_c5 = C2f(512 + 512, 512, n=3, shortcut=True)  # concat P4'ds + P5
+        # 自底向上 PAN：在融合前，保持模态独立做尺度交互（逐层对齐）
+        self.pan_down4 = ConvBNAct(C3c, C4c, 3, 2)               # P3(C3) -> stride2 -> C4
+        self.pan_c4 = C2f(C4c + C4c, C4c, n=3, shortcut=True)    # concat P3ds(C4) + P4(C4) -> C4
+        self.pan_down5 = ConvBNAct(C4c, C5c, 3, 2)               # P4(C4) -> stride2 -> C5
+        self.pan_c5 = C2f(C5c + C5c, C5c, n=3, shortcut=True)    # concat P4ds(C5) + P5(C5) -> C5
+        self.pan_down6 = ConvBNAct(C5c, C6c, 3, 2)               # P5(C5) -> stride2 -> C6
+        self.pan_c6 = C2f(C6c + C6c, C6c, n=3, shortcut=True)    # concat P5ds(C6) + P6(C6) -> C6
 
-    def forward(self, rgb_feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                      ir_feats:  Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
-        r3, r4, r5 = rgb_feats
-        i3, i4, i5 = ir_feats
-
-        # lateral to 512
-        R5 = self.lat5(r5); I5 = self.lat5(i5)
-        R4 = self.lat4(r4); I4 = self.lat4(i4)
-        R3 = self.lat3(r3); I3 = self.lat3(i3)
+    def forward(self, rgb_feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+                      ir_feats:  Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]):
+        r3, r4, r5, r6 = rgb_feats
+        i3, i4, i5, i6 = ir_feats
 
         # RGB top-down
-        p4 = self.smooth4(R4 + F.interpolate(R5, scale_factor=2.0, mode="nearest"))
-        p3 = self.smooth3(R3 + F.interpolate(p4, scale_factor=2.0, mode="nearest"))
+        r6_to5 = self.up6_to5(r6)
+        p5 = self.smooth5(r5 + F.interpolate(r6_to5, scale_factor=2.0, mode="nearest"))
+        r5_to4 = self.up5_to4(p5)
+        p4 = self.smooth4(r4 + F.interpolate(r5_to4, scale_factor=2.0, mode="nearest"))
+        p4_to3 = self.up4_to3(p4)
+        p3 = self.smooth3(r3 + F.interpolate(p4_to3, scale_factor=2.0, mode="nearest"))
         # IR top-down
-        p4_i = self.smooth4(I4 + F.interpolate(I5, scale_factor=2.0, mode="nearest"))
-        p3_i = self.smooth3(I3 + F.interpolate(p4_i, scale_factor=2.0, mode="nearest"))
+        i6_to5 = self.up6_to5(i6)
+        p5_i = self.smooth5(i5 + F.interpolate(i6_to5, scale_factor=2.0, mode="nearest"))
+        i5_to4 = self.up5_to4(p5_i)
+        p4_i = self.smooth4(i4 + F.interpolate(i5_to4, scale_factor=2.0, mode="nearest"))
+        p4_i_to3 = self.up4_to3(p4_i)
+        p3_i = self.smooth3(i3 + F.interpolate(p4_i_to3, scale_factor=2.0, mode="nearest"))
 
         # 自底向上 PAN（在融合前，保持模态独立）
         p4_bu = self.pan_c4(torch.cat([self.pan_down4(p3), p4], dim=1))
-        p5_bu = self.pan_c5(torch.cat([self.pan_down5(p4_bu), R5], dim=1))
+        p5_bu = self.pan_c5(torch.cat([self.pan_down5(p4_bu), p5], dim=1))
+        p6_bu = self.pan_c6(torch.cat([self.pan_down6(p5_bu), r6], dim=1))
 
         p4_bu_i = self.pan_c4(torch.cat([self.pan_down4(p3_i), p4_i], dim=1))
-        p5_bu_i = self.pan_c5(torch.cat([self.pan_down5(p4_bu_i), I5], dim=1))
+        p5_bu_i = self.pan_c5(torch.cat([self.pan_down5(p4_bu_i), p5_i], dim=1))
+        p6_bu_i = self.pan_c6(torch.cat([self.pan_down6(p5_bu_i), i6], dim=1))
+
+        # F6
+        r6_m = self.rgb_mlp6(p6_bu)
+        i6_m = self.ir_mlp6(p6_bu_i)
+        c6_m = self.fuse6(self.cat_mlp6(torch.cat([p6_bu, p6_bu_i], dim=1)))
+        w6 = self.gate6(r6_m, i6_m, c6_m)
+        F6 = r6_m * w6[0] + i6_m * w6[1] + c6_m * w6[2]
 
         # F5
         r5_m = self.rgb_mlp5(p5_bu)
@@ -970,17 +1168,17 @@ class DualFusionNeckXAttnL(nn.Module):
         w3 = self.gate3(r3_m, i3_m, c3_m)
         F3 = r3_m * w3[0] + i3_m * w3[1] + c3_m * w3[2]
 
-        # 通道压缩
-        P3 = self.out3(F3)   # 256
-        P4 = self.out4(F4)   # 256
-        P5 = self.out5(F5)   # 256
+        P3 = self.out3(F3)   # C3c
+        P4 = self.out4(F4)   # C4c
+        P5 = self.out5(F5)   # C5c
+        P6 = self.out6(F6)   # C6c
 
-        return P3, P4, P5
+        return P3, P4, P5, P6
 
 class DetectHead(nn.Module):
     """
     Anchor-free 解耦头 + DFL（对齐 YOLOv8 思路）
-      - reg 分支输出 4*(reg_max+1) 的离散距离分布
+      - reg 分支输出 4*reg_max 的离散距离分布（bins=reg_max，Ultralytics/YOLOv8 风格）
       - cls 分支输出 nc 类概率（无 obj 分支）
     """
     def __init__(self, nc: int, ch: List[int], reg_max: int = 16,
@@ -993,7 +1191,7 @@ class DetectHead(nn.Module):
         self.strides = list(strides)
 
         # DFL integral (distribution -> distance expectation)
-        self.register_buffer("dfl_proj", torch.arange(reg_max + 1, dtype=torch.float32).view(1, 1, reg_max + 1, 1, 1),
+        self.register_buffer("dfl_proj", torch.arange(reg_max, dtype=torch.float32).view(1, 1, reg_max, 1, 1),
                              persistent=False)
 
         self.stems = nn.ModuleList([ConvBNAct(c, c, k=1, s=1) for c in ch])
@@ -1007,7 +1205,7 @@ class DetectHead(nn.Module):
         ) for c in ch])
 
         self.cls_pred = nn.ModuleList([nn.Conv2d(c, nc, 1) for c in ch])
-        self.reg_pred = nn.ModuleList([nn.Conv2d(c, 4 * (reg_max + 1), 1) for c in ch])
+        self.reg_pred = nn.ModuleList([nn.Conv2d(c, 4 * reg_max, 1) for c in ch])
 
         self._bias_init()
 
@@ -1018,9 +1216,9 @@ class DetectHead(nn.Module):
             cls_feat = self.cls_conv[i](x)
             reg_feat = self.reg_conv[i](x)
             cls_out = self.cls_pred[i](cls_feat)          # (B, nc, H, W)
-            reg_out = self.reg_pred[i](reg_feat)          # (B, 4*(reg_max+1), H, W)
+            reg_out = self.reg_pred[i](reg_feat)          # (B, 4*reg_max, H, W)
             # Ultralytics-like: merge per-level outputs to a single tensor
-            # (B, nc + 4*(reg_max+1), H, W)
+            # (B, nc + 4*reg_max, H, W)
             outputs.append(torch.cat([reg_out, cls_out], dim=1))
         return outputs
 
@@ -1047,11 +1245,11 @@ class DetectHead(nn.Module):
 
     def dfl_integral(self, reg_out: torch.Tensor) -> torch.Tensor:
         """
-        reg_out: (B, 4*(reg_max+1), H, W) logits
+        reg_out: (B, 4*reg_max, H, W) logits
         returns: (B, 4, H, W) distances (in bins, not multiplied by stride)
         """
         B, _, H, W = reg_out.shape
-        x = reg_out.view(B, 4, self.reg_max + 1, H, W)
+        x = reg_out.view(B, 4, self.reg_max, H, W)
         x = x.softmax(2)
         # expectation over bins
         dist = (x * self.dfl_proj.to(x.dtype)).sum(2)
@@ -1060,14 +1258,14 @@ class DetectHead(nn.Module):
     def decode(self, preds: List[torch.Tensor], conf_thr: float = 0.25) -> torch.Tensor:
         """
         Decode merged head outputs to a unified prediction tensor:
-          preds: list of (B, nc + 4*(reg_max+1), H, W)
+          preds: list of (B, nc + 4*reg_max, H, W)
         returns:
           y: (B, N, 4 + nc) where boxes are xyxy in input-pixel coordinates
         """
         device = preds[0].device
         bs = preds[0].shape[0]
         out = []
-        reg_ch = 4 * (self.reg_max + 1)
+        reg_ch = 4 * self.reg_max
 
         for i, p in enumerate(preds):
             reg_out = p[:, :reg_ch]
@@ -1122,159 +1320,300 @@ class DetectHead(nn.Module):
             dets.append(det)
         return dets
 
+def bbox_iou(box1: torch.Tensor, box2: torch.Tensor, *, CIoU: bool = False, eps: float = 1e-7) -> torch.Tensor:
+    """
+    IoU / CIoU for xyxy boxes. Supports broadcasting.
+    Args:
+        box1: (...,4) xyxy
+        box2: (...,4) xyxy
+    """
+    # IoU
+    inter = (torch.min(box1[..., 2:], box2[..., 2:]) - torch.max(box1[..., :2], box2[..., :2])).clamp(min=0)
+    inter_area = inter[..., 0] * inter[..., 1]
+    w1 = (box1[..., 2] - box1[..., 0]).clamp(min=0)
+    h1 = (box1[..., 3] - box1[..., 1]).clamp(min=0)
+    w2 = (box2[..., 2] - box2[..., 0]).clamp(min=0)
+    h2 = (box2[..., 3] - box2[..., 1]).clamp(min=0)
+    area1 = w1 * h1
+    area2 = w2 * h2
+    union = area1 + area2 - inter_area + eps
+    iou = inter_area / union
+    if not CIoU:
+        return iou
+
+    # CIoU
+    cx1 = (box1[..., 0] + box1[..., 2]) * 0.5
+    cy1 = (box1[..., 1] + box1[..., 3]) * 0.5
+    cx2 = (box2[..., 0] + box2[..., 2]) * 0.5
+    cy2 = (box2[..., 1] + box2[..., 3]) * 0.5
+    rho2 = (cx2 - cx1) ** 2 + (cy2 - cy1) ** 2
+
+    c_x1 = torch.min(box1[..., 0], box2[..., 0])
+    c_y1 = torch.min(box1[..., 1], box2[..., 1])
+    c_x2 = torch.max(box1[..., 2], box2[..., 2])
+    c_y2 = torch.max(box1[..., 3], box2[..., 3])
+    c2 = (c_x2 - c_x1) ** 2 + (c_y2 - c_y1) ** 2 + eps
+
+    v = (4 / (math.pi ** 2)) * (torch.atan(w2 / (h2 + eps)) - torch.atan(w1 / (h1 + eps))) ** 2
+    with torch.no_grad():
+        alpha = v / (1 - iou + v + eps)
+    ciou = iou - (rho2 / c2 + alpha * v)
+    return ciou
+
+
+class TaskAlignedAssigner(nn.Module):
+    """
+    YOLOv8/PP-YOLOE-style TaskAlignedAssigner (anchor-free).
+      metric = (cls_score ** alpha) * (iou ** beta)
+      - candidates: anchor points inside GT
+      - select topk per GT by metric
+      - resolve conflicts by highest IoU
+      - classification target score: (metric / metric_max_per_gt) * iou
+    """
+    def __init__(self, topk: int = 10, alpha: float = 0.5, beta: float = 6.0):
+        super().__init__()
+        self.topk = int(topk)
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+
+    @torch.no_grad()
+    def forward(self,
+                pred_scores: torch.Tensor,   # (N, nc) sigmoid probs
+                pred_bboxes: torch.Tensor,   # (N, 4)  xyxy (pixels)
+                anchor_points: torch.Tensor, # (N, 2)  (x,y) pixels
+                gt_labels: torch.Tensor,     # (M,)
+                gt_bboxes: torch.Tensor,     # (M,4) xyxy pixels
+                num_classes: int):
+        device = pred_bboxes.device
+        eps = 1e-9
+        N = pred_bboxes.shape[0]
+        M = gt_bboxes.shape[0]
+
+        target_bboxes = torch.zeros((N, 4), device=device, dtype=pred_bboxes.dtype)
+        target_scores = torch.zeros((N, num_classes), device=device, dtype=pred_scores.dtype)
+        fg_mask = torch.zeros((N,), device=device, dtype=torch.bool)
+        target_gt_idx = torch.zeros((N,), device=device, dtype=torch.long)
+
+        if M == 0 or N == 0:
+            return target_bboxes, target_scores, fg_mask, target_gt_idx
+
+        gt_labels = gt_labels.to(device=device, dtype=torch.long).clamp(min=0, max=num_classes - 1)
+        gt_bboxes = gt_bboxes.to(device=device, dtype=pred_bboxes.dtype)
+
+        # anchors inside GT boxes
+        x, y = anchor_points[:, 0], anchor_points[:, 1]
+        l = x[:, None] - gt_bboxes[None, :, 0]
+        t = y[:, None] - gt_bboxes[None, :, 1]
+        r = gt_bboxes[None, :, 2] - x[:, None]
+        b = gt_bboxes[None, :, 3] - y[:, None]
+        in_gts = (l > 0) & (t > 0) & (r > 0) & (b > 0)  # (N,M)
+
+        # IoU between predicted boxes and GT
+        ious = bbox_iou(pred_bboxes[:, None, :], gt_bboxes[None, :, :], CIoU=False)  # (N,M)
+
+        # classification score aligned with GT class
+        cls_score = pred_scores[:, gt_labels]  # (N,M)
+        align_metric = (cls_score.clamp(min=0) ** self.alpha) * (ious.clamp(min=0) ** self.beta)
+
+        # only consider anchors inside GT
+        align_metric = align_metric.clone()
+        align_metric[~in_gts] = -1e8
+
+        k = min(self.topk, N)
+        topk_idx = torch.topk(align_metric, k=k, dim=0, largest=True).indices  # (k,M)
+        mask_topk = torch.zeros((N, M), device=device, dtype=torch.bool)
+        mask_topk[topk_idx, torch.arange(M, device=device)] = True
+        mask_pos = mask_topk & in_gts
+
+        # resolve conflicts: assign each anchor to GT with highest IoU among its positives
+        ious_pos = ious.clone()
+        ious_pos[~mask_pos] = -1.0
+        max_iou, gt_idx = ious_pos.max(dim=1)  # (N,)
+        fg_mask = max_iou > -0.5
+        target_gt_idx = gt_idx.clamp(min=0)
+
+        if fg_mask.any():
+            # per-GT max metric for normalization
+            metric_pos = align_metric.clone()
+            metric_pos[~mask_pos] = -1e8
+            metric_max = metric_pos.max(dim=0).values.clamp(min=eps)  # (M,)
+
+            fg_inds = fg_mask.nonzero(as_tuple=False).squeeze(1)
+            gti = target_gt_idx[fg_inds]
+            target_bboxes[fg_inds] = gt_bboxes[gti]
+
+            # score: (metric / max_metric_per_gt) * iou
+            score = (align_metric[fg_inds, gti] / metric_max[gti]) * ious[fg_inds, gti]
+            score = score.clamp(min=0.0, max=1.0)
+            tcls = gt_labels[gti].clamp(min=0, max=num_classes - 1)
+            target_scores[fg_inds, tcls] = score
+
+        return target_bboxes, target_scores, fg_mask, target_gt_idx
+
+
 class YoloLoss(nn.Module):
     """
-    更贴近 YOLOv8 的 anchor-free + DFL 损失：
-      - 正样本：中心落入 GT 且在中心半径范围内，若无则取距中心最近 topk
-      - cls：Focal BCE，软标签为 IoU（TaskAligned 风格）
-      - reg：IoU 损失；DFL：离散距离分布
+    YOLOv8-style loss:
+      - TaskAlignedAssigner for matching (cls-aligned + IoU-aligned)
+      - quality-guided cls targets (soft labels)
+      - IoU/CIoU box loss + DFL, normalized by sum(target_scores)
     """
     def __init__(self, num_classes: int, reg_max: int = 16,
-                 lambda_box=7.5, lambda_cls=1.0, lambda_dfl=1.5,
-                 center_radius: float = 2.5, topk: int = 10):
+                 lambda_box: float = 7.5, lambda_cls: float = 0.5, lambda_dfl: float = 1.5,
+                 tal_topk: int = 10, tal_alpha: float = 0.5, tal_beta: float = 6.0):
         super().__init__()
-        self.nc = num_classes
-        self.reg_max = reg_max
-        self.l_box = lambda_box
-        self.l_cls = lambda_cls
-        self.l_dfl = lambda_dfl
-        self.center_radius = center_radius
-        self.topk = topk
+        self.nc = int(num_classes)
+        self.reg_max = int(reg_max)
+        self.l_box = float(lambda_box)
+        self.l_cls = float(lambda_cls)
+        self.l_dfl = float(lambda_dfl)
 
-    @staticmethod
-    def bbox_iou(box1, box2):
-        inter = (torch.min(box1[..., 2:], box2[..., 2:]) - torch.max(box1[..., :2], box2[..., :2])).clamp(min=0)
-        inter_area = inter[..., 0] * inter[..., 1]
-        area1 = (box1[..., 2] - box1[..., 0]) * (box1[..., 3] - box1[..., 1])
-        area2 = (box2[..., 2] - box2[..., 0]) * (box2[..., 3] - box2[..., 1])
-        union = area1 + area2 - inter_area + 1e-6
-        return inter_area / union
+        self.assigner = TaskAlignedAssigner(topk=tal_topk, alpha=tal_alpha, beta=tal_beta)
+        self.bce = nn.BCEWithLogitsLoss(reduction="none")
 
-    def dfl_loss(self, pred, target):
-        n, _, bins = pred.shape
-        t = target.clamp(min=0, max=self.reg_max - 1e-4)
-        l = t.floor().long()
-        r = (l + 1).clamp(max=self.reg_max)
-        wl = r.float() - t
-        wr = t - l.float()
-        pred = pred.reshape(n * 4, bins)
-        l_loss = F.cross_entropy(pred, l.reshape(-1), reduction="none")
-        r_loss = F.cross_entropy(pred, r.reshape(-1), reduction="none")
-        return (l_loss * wl.view(-1) + r_loss * wr.view(-1)).mean()
+        # bins projection for DFL decode (0..reg_max-1)
+        self.register_buffer("dfl_proj", torch.arange(self.reg_max, dtype=torch.float32), persistent=False)
 
-    def focal_bce(self, logits, targets, alpha=0.25, gamma=2.0):
-        prob = logits.sigmoid()
-        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-        p_t = prob * targets + (1 - prob) * (1 - targets)
-        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-        return ce * alpha_t * ((1 - p_t) ** gamma)
-
-    def forward(self, preds, targets, strides, device=None):
+    def _make_anchors(self, preds: List[torch.Tensor], strides: List[int], offset: float = 0.5):
         device = preds[0].device
-        bs = len(targets)
-        total_box = torch.zeros(1, device=device)
-        total_cls = torch.zeros(1, device=device)
-        total_dfl = torch.zeros(1, device=device)
+        dtype = preds[0].dtype
+        anchor_points = []
+        stride_tensor = []
+        for i, p in enumerate(preds):
+            _, _, h, w = p.shape
+            stride = float(strides[i])
+            gy, gx = torch.meshgrid(
+                torch.arange(h, device=device),
+                torch.arange(w, device=device),
+                indexing="ij"
+            )
+            points = torch.stack([(gx + offset) * stride, (gy + offset) * stride], dim=-1).view(-1, 2)  # (HW,2)
+            anchor_points.append(points)
+            stride_tensor.append(torch.full((h * w, 1), stride, device=device, dtype=dtype))
+        return torch.cat(anchor_points, dim=0), torch.cat(stride_tensor, dim=0)
 
-        for b in range(bs):
-            tboxes = targets[b]["boxes"].to(device)
-            tcls   = targets[b]["labels"].to(device)
-            if tboxes.numel() == 0:
-                # preds: list of (B, 4*(reg_max+1)+nc, H, W)
-                reg_ch = 4 * (self.reg_max + 1)
-                for p in preds:
-                    cls_out = p[:, reg_ch:][b]
-                    total_cls += F.binary_cross_entropy_with_logits(cls_out, torch.zeros_like(cls_out), reduction="sum")
+    def _decode_bboxes(self,
+                       anchor_points: torch.Tensor,  # (N,2) pixels
+                       pred_dist: torch.Tensor,      # (B,N,4,reg_max) logits
+                       stride_tensor: torch.Tensor): # (N,1) pixels
+        B, N, _, _ = pred_dist.shape
+        proj = self.dfl_proj.to(device=pred_dist.device, dtype=pred_dist.dtype)  # (reg_max,)
+        prob = pred_dist.softmax(-1)
+        dist = (prob * proj).sum(-1)  # (B,N,4) in bins (grid units)
+        dist = dist * stride_tensor.view(1, N, 1)  # pixels
+        x = anchor_points[:, 0].view(1, N)
+        y = anchor_points[:, 1].view(1, N)
+        x1 = x - dist[:, :, 0]
+        y1 = y - dist[:, :, 1]
+        x2 = x + dist[:, :, 2]
+        y2 = y + dist[:, :, 3]
+        return torch.stack([x1, y1, x2, y2], dim=-1)  # (B,N,4) pixels
+
+    def _bbox2dist(self,
+                   anchor_points: torch.Tensor,  # (n,2) pixels
+                   target_bboxes: torch.Tensor,  # (n,4) pixels
+                   stride: torch.Tensor):        # (n,1) pixels
+        # distances in bins (divide by stride)
+        x = anchor_points[:, 0]
+        y = anchor_points[:, 1]
+        l = (x - target_bboxes[:, 0]) / stride.squeeze(1)
+        t = (y - target_bboxes[:, 1]) / stride.squeeze(1)
+        r = (target_bboxes[:, 2] - x) / stride.squeeze(1)
+        b = (target_bboxes[:, 3] - y) / stride.squeeze(1)
+        dist = torch.stack([l, t, r, b], dim=-1)
+        # clamp to representable DFL bin range [0, reg_max-1]
+        # (distances larger than reg_max-1 saturate to the last bin)
+        return dist.clamp(min=0.0, max=float(self.reg_max - 1))
+
+    def _df_loss(self, pred_dist: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        pred_dist: (n,4,reg_max) logits
+        target:    (n,4) float in [0, reg_max)
+        returns:   (n,) per-anchor DFL loss (sum over 4 edges)
+        """
+        n = target.shape[0]
+        if n == 0:
+            return torch.zeros((0,), device=pred_dist.device, dtype=pred_dist.dtype)
+        # Keep targets in [0, reg_max-1] and handle the right-edge case (== reg_max-1)
+        # so DFL still trains the last bin with weight 1.0 rather than degenerating to 0.
+        target = target.clamp(min=0.0, max=float(self.reg_max - 1))
+        left = target.floor().long()
+        right = (left + 1).clamp(max=self.reg_max - 1)
+        wl = right.float() - target
+        wr = target - left.float()
+        same_bin = right == left  # happens at the upper boundary (and only there with reg_max>1)
+        wl = torch.where(same_bin, torch.ones_like(wl), wl)
+        wr = torch.where(same_bin, torch.zeros_like(wr), wr)
+
+        pred = pred_dist.reshape(-1, self.reg_max)  # (n*4, reg_max)
+        loss_l = F.cross_entropy(pred, left.reshape(-1), reduction="none")
+        loss_r = F.cross_entropy(pred, right.reshape(-1), reduction="none")
+        loss = loss_l * wl.reshape(-1) + loss_r * wr.reshape(-1)
+        return loss.view(n, 4).sum(dim=1)
+
+    def forward(self, preds: List[torch.Tensor], targets: List[Dict], strides: List[int], device=None):
+        device = preds[0].device
+        B = preds[0].shape[0]
+
+        reg_ch = 4 * self.reg_max
+        # flatten per-level outputs
+        cls_logits_all = []
+        reg_logits_all = []
+        for p in preds:
+            reg = p[:, :reg_ch]
+            cls = p[:, reg_ch:]
+            cls_logits_all.append(cls.permute(0, 2, 3, 1).reshape(B, -1, self.nc))
+            reg_logits_all.append(reg.permute(0, 2, 3, 1).reshape(B, -1, 4, self.reg_max))
+        cls_logits = torch.cat(cls_logits_all, dim=1)  # (B,N,nc)
+        reg_logits = torch.cat(reg_logits_all, dim=1)  # (B,N,4,reg_max)
+
+        anchor_points, stride_tensor = self._make_anchors(preds, strides, offset=0.5)  # (N,2), (N,1)
+        pred_scores = cls_logits.sigmoid()  # (B,N,nc)
+        pred_bboxes = self._decode_bboxes(anchor_points, reg_logits, stride_tensor)  # (B,N,4) pixels
+
+        N = anchor_points.shape[0]
+        target_bboxes = torch.zeros((B, N, 4), device=device, dtype=pred_bboxes.dtype)
+        target_scores = torch.zeros((B, N, self.nc), device=device, dtype=pred_scores.dtype)
+        fg_mask = torch.zeros((B, N), device=device, dtype=torch.bool)
+
+        for b in range(B):
+            gt_bboxes = targets[b]["boxes"].to(device)
+            gt_labels = targets[b]["labels"].to(device)
+            if gt_bboxes.numel() == 0:
                 continue
+            t_bboxes, t_scores, t_fg, _ = self.assigner(
+                pred_scores[b], pred_bboxes[b], anchor_points, gt_labels, gt_bboxes, self.nc
+            )
+            target_bboxes[b] = t_bboxes
+            target_scores[b] = t_scores
+            fg_mask[b] = t_fg
 
-            reg_ch = 4 * (self.reg_max + 1)
-            for l, p in enumerate(preds):
-                reg_out = p[:, :reg_ch]
-                cls_out = p[:, reg_ch:]
-                stride = strides[l]
-                _, _, h, w = cls_out.shape
-                gy, gx = torch.meshgrid(
-                    torch.arange(h, device=device),
-                    torch.arange(w, device=device),
-                    indexing="ij"
-                )
-                centers = torch.stack([gx + 0.5, gy + 0.5], dim=-1).view(-1, 2)  # (HW,2)
+        target_scores_sum = target_scores.sum().clamp(min=1.0)
 
-                gt = tboxes / stride
-                gtc = tcls
-                gt_xy1 = gt[:, :2]
-                gt_xy2 = gt[:, 2:4]
-                gt_ctr = (gt_xy1 + gt_xy2) * 0.5
+        # cls loss over all anchors (targets are soft scores)
+        loss_cls = self.bce(cls_logits, target_scores).sum() / target_scores_sum
 
-                left = centers[:, None, 0] - gt_xy1[None, :, 0]
-                top = centers[:, None, 1] - gt_xy1[None, :, 1]
-                right = gt_xy2[None, :, 0] - centers[:, None, 0]
-                bottom = gt_xy2[None, :, 1] - centers[:, None, 1]
-                in_gt = (left > 0) & (top > 0) & (right > 0) & (bottom > 0)
+        # box + dfl loss over positives
+        if fg_mask.any():
+            bbox_weight = target_scores.sum(dim=-1)[fg_mask]  # (n_pos,)
+            pred_b = pred_bboxes[fg_mask]
+            tgt_b = target_bboxes[fg_mask]
+            iou = bbox_iou(pred_b, tgt_b, CIoU=True)
+            loss_box = ((1.0 - iou) * bbox_weight).sum() / target_scores_sum
 
-                radius = self.center_radius
-                in_ctr = (centers[:, None, 0] >= (gt_ctr[None, :, 0] - radius)) & \
-                         (centers[:, None, 0] <= (gt_ctr[None, :, 0] + radius)) & \
-                         (centers[:, None, 1] >= (gt_ctr[None, :, 1] - radius)) & \
-                         (centers[:, None, 1] <= (gt_ctr[None, :, 1] + radius))
+            pred_d = reg_logits[fg_mask]  # (n_pos,4,reg_max)
+            pts = anchor_points.view(1, N, 2).expand(B, N, 2)[fg_mask]  # (n_pos,2)
+            st = stride_tensor.view(1, N, 1).expand(B, N, 1)[fg_mask]   # (n_pos,1)
+            tgt_dist = self._bbox2dist(pts, tgt_b, st)  # (n_pos,4)
+            dfl = self._df_loss(pred_d, tgt_dist)       # (n_pos,)
+            loss_dfl = (dfl * bbox_weight).sum() / target_scores_sum
+        else:
+            loss_box = torch.zeros((), device=device)
+            loss_dfl = torch.zeros((), device=device)
 
-                mask = in_gt & in_ctr
-
-                if not mask.any():
-                    dist = (centers[:, None, :] - gt_ctr[None, :, :]).pow(2).sum(-1).sqrt()
-                    topk = min(self.topk, centers.size(0))
-                    _, idx = dist.topk(topk, dim=0, largest=False)
-                    mask = torch.zeros_like(dist, dtype=torch.bool)
-                    mask.scatter_(0, idx, True)
-
-                pos_idx = mask.nonzero(as_tuple=False)
-                if pos_idx.numel() == 0:
-                    total_cls += F.binary_cross_entropy_with_logits(cls_out[b], torch.zeros_like(cls_out[b]), reduction="sum")
-                    continue
-
-                point_idx = pos_idx[:, 0]
-                gt_idx = pos_idx[:, 1]
-                cxcy = centers[point_idx]
-                assigned_gt = gt[gt_idx]
-                assigned_cls = gtc[gt_idx]
-
-                ltrb = torch.stack([
-                    cxcy[:, 0] - assigned_gt[:, 0],
-                    cxcy[:, 1] - assigned_gt[:, 1],
-                    assigned_gt[:, 2] - cxcy[:, 0],
-                    assigned_gt[:, 3] - cxcy[:, 1],
-                ], dim=1).clamp(min=0)
-
-                cls_flat = cls_out[b].permute(1, 2, 0).reshape(-1, self.nc)
-                reg_flat = reg_out[b].permute(1, 2, 0).reshape(-1, 4, self.reg_max + 1)
-                cls_sel = cls_flat[point_idx]
-                reg_sel = reg_flat[point_idx]
-
-                total_dfl += self.dfl_loss(reg_sel, ltrb)
-
-                reg_prob = reg_sel.softmax(-1)
-                proj = reg_prob * torch.arange(self.reg_max + 1, device=device)
-                dist = proj.sum(-1)
-                x1 = cxcy[:, 0] - dist[:, 0]
-                y1 = cxcy[:, 1] - dist[:, 1]
-                x2 = cxcy[:, 0] + dist[:, 2]
-                y2 = cxcy[:, 1] + dist[:, 3]
-                pred_box = torch.stack([x1, y1, x2, y2], dim=1)
-                iou = self.bbox_iou(pred_box, assigned_gt).detach()
-                total_box += (1 - iou).sum()
-
-                cls_target = torch.zeros_like(cls_sel)
-                cls_target[torch.arange(cls_sel.size(0)), assigned_cls] = iou
-                total_cls += self.focal_bce(cls_sel, cls_target).sum()
-
-                neg_mask = torch.ones((h * w,), device=device, dtype=torch.bool)
-                neg_mask[point_idx] = False
-                if neg_mask.any():
-                    cls_neg = cls_flat[neg_mask]
-                    total_cls += self.focal_bce(cls_neg, torch.zeros_like(cls_neg)).sum()
-
-        loss = self.l_box * total_box + self.l_cls * total_cls + self.l_dfl * total_dfl
-        return loss, {"l_box": total_box.item(), "l_cls": total_cls.item(), "l_dfl": total_dfl.item()}
+        loss = self.l_box * loss_box + self.l_cls * loss_cls + self.l_dfl * loss_dfl
+        parts = {"l_box": float(loss_box.detach()), "l_cls": float(loss_cls.detach()), "l_dfl": float(loss_dfl.detach())}
+        return loss, parts
 
 class DualYoloV8L(nn.Module):
     def __init__(self, num_classes: int, imgsz: int = 640):
@@ -1283,43 +1622,43 @@ class DualYoloV8L(nn.Module):
         self.ir_backbone  = BackboneV8Large(3)
 
         # 独立的 YOLOv8-L 颈部（参数不共享）
-        self.rgb_neck = YoloV8NeckSingle(C3=256, C4=512, C5=1024)
-        self.ir_neck  = YoloV8NeckSingle(C3=256, C4=512, C5=1024)
+        self.rgb_neck = YoloV8NeckSingle(C3=256, C4=512, C5=1024, C6=1024)
+        self.ir_neck  = YoloV8NeckSingle(C3=256, C4=512, C5=1024, C6=1024)
 
         # 注意: d_model 可设 96/128；'scalar' 更省显存，'channel' 表达力更强
         self.fusion_neck = DualFusionNeckXAttnL(
-            C3c=256, C4c=512, C5c=1024,
+            C3c=256, C4c=512, C5c=1024, C6c=1024,
             gate_mode='channel',
             d_model=96,
             reduction=16
         )
 
-        self.strides = [8, 16, 32]
-        # anchor-free 检测头（PAN 后统一 256 通道）
-        self.detect = DetectHead(num_classes, ch=[256, 256, 256], reg_max=16, strides=self.strides, img_size=imgsz)
+        self.strides = [8, 16, 32, 64]
+        # anchor-free 检测头（融合颈部输出保持 256/512/1024/1024 四尺度通道）
+        self.detect = DetectHead(num_classes, ch=[256, 512, 1024, 1024], reg_max=16, strides=self.strides, img_size=imgsz)
 
     def forward(self, rgb, ir):
         # 双模态各自独立的 backbone + neck
-        r3, r4, r5 = self.rgb_backbone(rgb)
-        i3, i4, i5 = self.ir_backbone(ir)
+        r3, r4, r5, r6 = self.rgb_backbone(rgb)
+        i3, i4, i5, i6 = self.ir_backbone(ir)
 
-        r_feats = self.rgb_neck((r3, r4, r5))
-        i_feats = self.ir_neck((i3, i4, i5))
+        r_feats = self.rgb_neck((r3, r4, r5, r6))
+        i_feats = self.ir_neck((i3, i4, i5, i6))
 
         # 融合颈部在 neck 输出处进行跨模态门控
-        F3, F4, F5 = self.fusion_neck(r_feats, i_feats)
-        outs = self.detect([F3, F4, F5])
+        F3, F4, F5, F6 = self.fusion_neck(r_feats, i_feats)
+        outs = self.detect([F3, F4, F5, F6])
         return outs
 
 def decode_predictions(preds, strides, conf_thr=0.25, img_size=640, reg_max=16):
     """
-    Anchor-free 解码：preds: List[(B, 4*(reg_max+1)+nc, H, W)] per level
+    Anchor-free 解码：preds: List[(B, 4*reg_max+nc, H, W)] per level
     返回 [B] -> (N,6) [x1,y1,x2,y2,conf,cls]
     """
     device = preds[0].device
     bs = preds[0].shape[0]
     out_per_im = [[] for _ in range(bs)]
-    reg_ch = 4 * (reg_max + 1)
+    reg_ch = 4 * reg_max
 
     for l, p in enumerate(preds):
         reg_out = p[:, :reg_ch]
@@ -1338,9 +1677,9 @@ def decode_predictions(preds, strides, conf_thr=0.25, img_size=640, reg_max=16):
         cy = cy.view(-1)
 
         # 回归距离
-        reg_out = reg_out.permute(0, 2, 3, 1).reshape(B, -1, 4, reg_max + 1)
+        reg_out = reg_out.permute(0, 2, 3, 1).reshape(B, -1, 4, reg_max)
         reg_prob = reg_out.softmax(-1)
-        proj = reg_prob * torch.arange(reg_max + 1, device=device)
+        proj = reg_prob * torch.arange(reg_max, device=device)
         dist = proj.sum(-1) * stride  # (B, N, 4)
 
         x1 = cx[None, :] - dist[:, :, 0]
@@ -1480,29 +1819,65 @@ def compute_pr_map(preds_all, gts_all, iou_thr=0.5, num_classes=len(CANONICAL_CL
 
 def train(args):
     os.makedirs(args.logdir, exist_ok=True)
-    logger = setup_logger(os.path.join(args.logdir, "training.log"))
 
-    # ----- GPU selection -----
-    if args.gpu < 0 or not torch.cuda.is_available():
-        device = torch.device("cpu")
-        logger.info("Using CPU (either --gpu < 0 or CUDA not available).")
+    distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if distributed:
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        if getattr(args, "local_rank", -1) >= 0:
+            local_rank = int(args.local_rank)
+
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cpu")
+        dist.init_process_group(backend=backend, init_method="env://")
+
+        rank = get_rank()
+        world_size = get_world_size()
+        log_file = os.path.join(args.logdir, "training.log" if rank == 0 else f"training_rank{rank}.log")
+        logger = setup_logger(log_file, is_main=(rank == 0))
+        logger.info(f"DDP enabled | backend={backend} rank={rank}/{world_size} local_rank={local_rank} device={device}")
     else:
-        if args.gpu >= torch.cuda.device_count():
-            raise RuntimeError(f"--gpu={args.gpu} 超出可用 GPU 数量（共 {torch.cuda.device_count()} 张）。")
-        torch.cuda.set_device(args.gpu)
-        device = torch.device(f"cuda:{args.gpu}")
-        logger.info(f"Using CUDA device cuda:{args.gpu} — {torch.cuda.get_device_name(device)}")
+        rank = 0
+        world_size = 1
+        logger = setup_logger(os.path.join(args.logdir, "training.log"), is_main=True)
+
+        # ----- GPU selection (single process) -----
+        gpus = parse_gpus_arg(getattr(args, "gpus", ""))
+        if len(gpus) > 0:
+            if not torch.cuda.is_available():
+                logger.warning("`--gpus` 已设置但 CUDA 不可用，将回退到 CPU。")
+                device = torch.device("cpu")
+            else:
+                dev_cnt = torch.cuda.device_count()
+                for gid in gpus:
+                    if gid < 0 or gid >= dev_cnt:
+                        raise RuntimeError(f"--gpus 包含无效 GPU id: {gid}（共 {dev_cnt} 张）。")
+                torch.cuda.set_device(gpus[0])
+                device = torch.device(f"cuda:{gpus[0]}")
+                if len(gpus) > 1:
+                    logger.info(f"Using DataParallel on GPUs {gpus} (primary cuda:{gpus[0]})")
+                else:
+                    logger.info(f"Using CUDA device cuda:{gpus[0]} — {torch.cuda.get_device_name(device)}")
+        elif args.gpu < 0 or not torch.cuda.is_available():
+            device = torch.device("cpu")
+            logger.info("Using CPU (either --gpu < 0 or CUDA not available).")
+        else:
+            if args.gpu >= torch.cuda.device_count():
+                raise RuntimeError(f"--gpu={args.gpu} 超出可用 GPU 数量（共 {torch.cuda.device_count()} 张）。")
+            torch.cuda.set_device(args.gpu)
+            device = torch.device(f"cuda:{args.gpu}")
+            logger.info(f"Using CUDA device cuda:{args.gpu} — {torch.cuda.get_device_name(device)}")
 
     # Seeds
-    torch.manual_seed(args.seed); np.random.seed(args.seed); random.seed(args.seed)
+    seed = int(args.seed) + int(rank)
+    torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
 
     # Data
     train_ds = RGBIRDetDataset(args.train_csv, imgsz=args.imgsz, augment=True)
     val_ds   = RGBIRDetDataset(args.val_csv,   imgsz=args.imgsz, augment=False)
-    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=args.num_workers,
-                              collate_fn=collate_fn, pin_memory=True if device.type=='cuda' else False)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch, shuffle=False, num_workers=args.num_workers,
-                              collate_fn=collate_fn, pin_memory=True if device.type=='cuda' else False)
 
     # Model
     model = DualYoloV8L(num_classes=len(CANONICAL_CLASSES), imgsz=args.imgsz).to(device)
@@ -1511,7 +1886,7 @@ def train(args):
     criterion = YoloLoss(len(CANONICAL_CLASSES), reg_max=16)
 
     # ---------- 自动批大小估计，尽量吃满显存但不 OOM ----------
-    if device.type == "cuda" and args.auto_batch:
+    if device.type == "cuda" and args.auto_batch and (not distributed or is_main_process()):
         torch.cuda.empty_cache()
         try:
             free_mem, total_mem = torch.cuda.mem_get_info(device)
@@ -1549,9 +1924,73 @@ def train(args):
             logger.warning(f"Auto batch failed: {e}. 使用用户设定 batch={args.batch}")
             torch.cuda.empty_cache()
 
+    # DDP 下把 batch 同步到所有进程（global batch = args.batch * world_size）
+    if distributed:
+        b = torch.tensor([int(args.batch)], device=device, dtype=torch.int64)
+        dist.broadcast(b, src=0)
+        args.batch = int(b.item())
+
+    # DataLoaders (放到 auto-batch 之后，确保 batch_size 生效)
+    if distributed:
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch,
+            shuffle=False,
+            sampler=train_sampler,
+            num_workers=args.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True if device.type == "cuda" else False,
+        )
+        # val_loader 仅 rank0 用于评估：不使用 DistributedSampler，避免只评估子集
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True if device.type == "cuda" else False,
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True if device.type == "cuda" else False,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch,
+            shuffle=False,
+            num_workers=args.num_workers,
+            collate_fn=collate_fn,
+            pin_memory=True if device.type == "cuda" else False,
+        )
+
+    # Wrap model for multi-GPU
+    if distributed:
+        model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
+    else:
+        gpus = parse_gpus_arg(getattr(args, "gpus", ""))
+        if device.type == "cuda" and len(gpus) > 1:
+            model = nn.DataParallel(model, device_ids=gpus)
+
     best_map = 0.0
+    mosaic_closed = False
     for epoch in range(1, args.epochs+1):
+        # YOLOv8-style: disable mosaic/mixup in the last N epochs
+        if (not mosaic_closed) and getattr(args, "close_mosaic", 0) and epoch >= (args.epochs - int(args.close_mosaic) + 1):
+            train_ds.mosaic = False
+            train_ds.mixup_prob = 0.0
+            mosaic_closed = True
+            if (not distributed) or is_main_process():
+                logger.info(f"Close mosaic/mixup for last {args.close_mosaic} epochs (epoch {epoch} -> {args.epochs})")
         model.train()
+        if distributed:
+            train_sampler.set_epoch(epoch)
+        raw_model = unwrap_model(model)
         t0 = time.time()
         loss_meter = 0.0; meter = {"l_box":0.0,"l_cls":0.0,"l_dfl":0.0}
         nb = 0
@@ -1561,7 +2000,7 @@ def train(args):
             tgts = [{k:v.to(device) if torch.is_tensor(v) else v for k,v in t.items()} for t in targets]
 
             preds = model(rgbs, irs)
-            loss, parts = criterion(preds, tgts, model.strides)
+            loss, parts = criterion(preds, tgts, raw_model.strides)
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -1572,20 +2011,39 @@ def train(args):
             for k in meter: meter[k]+= parts[k]
 
         scheduler.step()
+        if distributed:
+            # reduce metrics for logging
+            t = torch.tensor(
+                [loss_meter, meter["l_box"], meter["l_cls"], meter["l_dfl"], float(nb)],
+                device=device,
+                dtype=torch.float32,
+            )
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            denom = max(t[4].item(), 1.0)
+            loss_meter = t[0].item() / denom
+            meter["l_box"] = t[1].item() / denom
+            meter["l_cls"] = t[2].item() / denom
+            meter["l_dfl"] = t[3].item() / denom
         dt = time.time()-t0
-        loss_meter /= max(nb,1)
-        for k in meter: meter[k] /= max(nb,1)
-        logger.info(f"Epoch {epoch}/{args.epochs} | loss={loss_meter:.4f} (box {meter['l_box']:.2f} cls {meter['l_cls']:.2f} dfl {meter['l_dfl']:.2f}) | {dt:.1f}s")
+        if not distributed:
+            loss_meter /= max(nb,1)
+            for k in meter: meter[k] /= max(nb,1)
+        if (not distributed) or is_main_process():
+            logger.info(f"Epoch {epoch}/{args.epochs} | loss={loss_meter:.4f} (box {meter['l_box']:.2f} cls {meter['l_cls']:.2f} dfl {meter['l_dfl']:.2f}) | {dt:.1f}s")
 
         # ---- Evaluation (从第20个epoch开始) ----
-        if epoch >= 20:
+        if distributed:
+            dist.barrier()
+
+        if epoch >= 20 and ((not distributed) or is_main_process()):
             model.eval()
+            raw_model = unwrap_model(model)
             preds_all = []; gts_all = []
             with torch.no_grad():
                 for rgbs, irs, targets, names in val_loader:
                     rgbs = rgbs.to(device); irs = irs.to(device)
                     outs = model(rgbs, irs)
-                    dets = model.detect.decode_dets(outs, conf_thr=args.conf_thres)
+                    dets = raw_model.detect.decode_dets(outs, conf_thr=args.conf_thres)
                     dets = [nms_axis_aligned(d, iou_thr=args.nms_iou) for d in dets]
                     preds_all.extend(dets)
                     for t in targets:
@@ -1608,7 +2066,7 @@ def train(args):
                 best_map = mAP50
                 save_path = os.path.join(args.logdir, "best.pt")
                 torch.save({
-                    "model": model.state_dict(),
+                    "model": raw_model.state_dict(),
                     "classes": CANONICAL_CLASSES,
                     "epoch": epoch,
                     "metrics": {
@@ -1617,12 +2075,23 @@ def train(args):
                     }
                 }, save_path)
                 logger.info(f"Saved best to {save_path} (mAP50={mAP50:.4f})")
-        else:
+        elif (not distributed) or is_main_process():
             logger.info(f"Epoch {epoch}/{args.epochs} | Skipping evaluation (will start from epoch 20)")
 
-    final_path = os.path.join(args.logdir, "last.pt")
-    torch.save({"model": model.state_dict(), "classes": CANONICAL_CLASSES}, final_path)
-    logger.info(f"Training finished. Final weights saved to {final_path}")
+        if distributed:
+            dist.barrier()
+
+    if distributed:
+        dist.barrier()
+
+    if (not distributed) or is_main_process():
+        final_path = os.path.join(args.logdir, "last.pt")
+        torch.save({"model": unwrap_model(model).state_dict(), "classes": CANONICAL_CLASSES}, final_path)
+        logger.info(f"Training finished. Final weights saved to {final_path}")
+
+    if distributed and is_dist_avail_and_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 def get_args():
     import argparse
@@ -1630,16 +2099,19 @@ def get_args():
     ap.add_argument("--train_csv", type=str, default="../LLVIP/llvip_train_paths.csv")
     ap.add_argument("--val_csv",   type=str, default="../LLVIP/llvip_test_paths.csv")
     ap.add_argument("--imgsz",     type=int, default=640)
-    ap.add_argument("--epochs",    type=int, default=100)
-    ap.add_argument("--batch",     type=int, default=7)
+    ap.add_argument("--epochs",    type=int, default=200)
+    ap.add_argument("--batch",     type=int, default=12)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--lr",        type=float, default=1e-3)
     ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
-    ap.add_argument("--logdir",    type=str, default="./runs/0105_rm")
+    ap.add_argument("--logdir",    type=str, default="./runs/0115_head")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
+    ap.add_argument("--gpus",      type=str, default="", help="单进程多 GPU（DataParallel），例如：--gpus 0,1,2。推荐优先用 DDP(torchrun)。")
+    ap.add_argument("--local_rank", type=int, default=-1, help=argparse.SUPPRESS)
     ap.add_argument("--max_det",       type=int, default=100)
+    ap.add_argument("--close_mosaic",  type=int, default=10, help="训练最后 N 个 epoch 关闭 mosaic/mixup（YOLOv8 默认 close_mosaic=10）")
     ap.add_argument("--auto_batch", action="store_true", help="自动估算批大小以尽量占满显存")
     ap.add_argument("--max_vram_frac", type=float, default=0.9, help="自动批大小的目标显存占用比例 (0-1)")
     return ap.parse_args()
