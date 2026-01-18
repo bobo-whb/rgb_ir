@@ -1708,7 +1708,7 @@ def decode_predictions(preds, strides, conf_thr=0.25, img_size=640, reg_max=16):
             out_per_im[b] = torch.zeros((0, 6), device=device)
     return out_per_im
 
-def nms_axis_aligned(dets: torch.Tensor, iou_thr=0.5, topk=100):
+def nms_axis_aligned(dets: torch.Tensor, iou_thr=0.5, topk=300):
     if dets.numel()==0: return dets
     keep = []
     for cls in dets[:,5].unique():
@@ -1723,7 +1723,7 @@ def nms_axis_aligned(dets: torch.Tensor, iou_thr=0.5, topk=100):
             D = D[1:][ious < iou_thr]
     return torch.cat(keep, dim=0) if keep else dets[:0]
 
-def compute_pr_map(preds_all, gts_all, iou_thr=0.5, num_classes=len(CANONICAL_CLASSES), max_det=100):
+def compute_pr_map(preds_all, gts_all, iou_thr=0.5, num_classes=len(CANONICAL_CLASSES), max_det=300):
     """
     preds_all: list[Tensor(M,6)] per image, [x1,y1,x2,y2,conf,cls]
     gts_all:   list[dict{'boxes':(N,4), 'labels':(N,)}] per image
@@ -1731,7 +1731,7 @@ def compute_pr_map(preds_all, gts_all, iou_thr=0.5, num_classes=len(CANONICAL_CL
     Returns:
         P:   macro-averaged precision over classes (float)
         R:   macro-averaged recall over classes   (float)
-        mAP: mean AP at the given IoU threshold (VOC-11pt)  (float)
+        mAP: mean AP at the given IoU threshold (COCO 101-pt)  (float)
         APs: list[float] per-class AP at the given IoU thr   (len = num_classes)
     """
     import numpy as np
@@ -1802,12 +1802,12 @@ def compute_pr_map(preds_all, gts_all, iou_thr=0.5, num_classes=len(CANONICAL_CL
         Npos = max(total_positives[c], 1)
         rec = tp_c / Npos
 
-        # VOC-2007 11点插值 AP
+        # COCO-style 101-point interpolated AP
         ap = 0.0
-        for t in np.linspace(0,1,11):
+        for t in np.linspace(0.0, 1.0, 101):
             mask = rec >= t
             ap += np.max(prec[mask]) if mask.any() else 0.0
-        ap /= 11.0
+        ap /= 101.0
         APs.append(float(ap))
         precs.append(float(prec[-1]))
         recs.append(float(rec[-1]))
@@ -2044,7 +2044,7 @@ def train(args):
                     rgbs = rgbs.to(device); irs = irs.to(device)
                     outs = model(rgbs, irs)
                     dets = raw_model.detect.decode_dets(outs, conf_thr=args.conf_thres)
-                    dets = [nms_axis_aligned(d, iou_thr=args.nms_iou) for d in dets]
+                    dets = [nms_axis_aligned(d, iou_thr=args.nms_iou, topk=args.max_det) for d in dets]
                     preds_all.extend(dets)
                     for t in targets:
                         g = { "boxes": t["boxes"].to(device), "labels": t["labels"].to(device) }
@@ -2105,12 +2105,12 @@ def get_args():
     ap.add_argument("--lr",        type=float, default=1e-3)
     ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
-    ap.add_argument("--logdir",    type=str, default="./runs/0115_head")
+    ap.add_argument("--logdir",    type=str, default="./runs/0116_fixmap")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
     ap.add_argument("--gpus",      type=str, default="", help="单进程多 GPU（DataParallel），例如：--gpus 0,1,2。推荐优先用 DDP(torchrun)。")
     ap.add_argument("--local_rank", type=int, default=-1, help=argparse.SUPPRESS)
-    ap.add_argument("--max_det",       type=int, default=100)
+    ap.add_argument("--max_det",       type=int, default=300)
     ap.add_argument("--close_mosaic",  type=int, default=10, help="训练最后 N 个 epoch 关闭 mosaic/mixup（YOLOv8 默认 close_mosaic=10）")
     ap.add_argument("--auto_batch", action="store_true", help="自动估算批大小以尽量占满显存")
     ap.add_argument("--max_vram_frac", type=float, default=0.9, help="自动批大小的目标显存占用比例 (0-1)")
