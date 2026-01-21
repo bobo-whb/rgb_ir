@@ -867,7 +867,7 @@ class MLP(nn.Module):
 
 class BackboneV8Large(nn.Module):
     """
-    YOLOv8-L 风格主干：输出 P3(1/8,256), P4(1/16,512), P5(1/32,1024), P6(1/64,1024)
+    YOLOv8-L 风格主干：输出 P3(1/8,256), P4(1/16,512), P5(1/32,1024)
     深度更大（n=3/6/6），通道更宽（64/128/256/512/1024）
     """
     def __init__(self, in_ch: int = 3):
@@ -890,37 +890,28 @@ class BackboneV8Large(nn.Module):
             C2f(1024, 1024, n=3, shortcut=True),
             SPPF(1024, 1024, k=5)
         )
-        # 额外的 P6（1/64）：由 P5 继续下采样得到
-        # 这里保持通道数 1024（便于与现有检测头/融合模块对齐）
-        self.layer5 = nn.Sequential(
-            ConvBNAct(1024, 1024, 3, 2),    # 20 -> 10
-            C2f(1024, 1024, n=3, shortcut=True),
-        )
 
     def forward(self, x):
         x = self.layer1(x)
         P3 = self.layer2(x)   # 1/8,  256 ch
         P4 = self.layer3(P3)  # 1/16, 512 ch
         P5 = self.layer4(P4)  # 1/32, 1024 ch
-        P6 = self.layer5(P5)  # 1/64, 1024 ch
-        return P3, P4, P5, P6
+        return P3, P4, P5
 
 class YoloV8NeckSingle(nn.Module):
     """
-    YOLOv8-L 风格单模态颈部（FPN + PAN），这里扩展为四尺度：
-      - 输入: P3(256), P4(512), P5(1024), P6(1024)
-      - 输出: N3(256), N4(512), N5(1024), N6(1024)
+    YOLOv8-L 风格单模态颈部（FPN + PAN）：
+      - 输入: P3(256), P4(512), P5(1024)
+      - 输出: N3(256), N4(512), N5(1024)
     """
-    def __init__(self, C3=256, C4=512, C5=1024, C6=1024):
+    def __init__(self, C3=256, C4=512, C5=1024):
         super().__init__()
         # 侧连降通道
-        self.lat6 = ConvBNAct(C6, 1024, 1, 1)
         self.lat5 = ConvBNAct(C5, 512, 1, 1)
         self.lat4 = ConvBNAct(C4, 512, 1, 1)
         self.lat3 = ConvBNAct(C3, 256, 1, 1)
 
         # Top-down FPN
-        self.fpn_p5 = C2f(512 + 1024, 512, n=3, shortcut=True)
         self.fpn_p4 = C2f(512 + 512, 512, n=3, shortcut=True)
         self.fpn_p3 = C2f(256 + 512, 256, n=3, shortcut=True)
 
@@ -929,24 +920,20 @@ class YoloV8NeckSingle(nn.Module):
         self.pan_p4 = C2f(256 + 512, 512, n=3, shortcut=True)
         self.pan_p5_down = ConvBNAct(512, 512, 3, 2)
         self.pan_p5 = C2f(512 + 512, 1024, n=3, shortcut=True)
-        self.pan_p6_down = ConvBNAct(1024, 1024, 3, 2)
-        self.pan_p6 = C2f(1024 + 1024, 1024, n=3, shortcut=True)
 
-    def forward(self, feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]):
-        p3, p4, p5, p6 = feats  # 来自主干
+    def forward(self, feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
+        p3, p4, p5 = feats  # 来自主干
 
         # Top-down
-        p6_lat = self.lat6(p6)                         # 1024
-        p5_td = self.fpn_p5(torch.cat([self.lat5(p5), F.interpolate(p6_lat, scale_factor=2.0, mode="nearest")], dim=1))  # 512
+        p5_td = self.lat5(p5)  # 512
         p4_td = self.fpn_p4(torch.cat([self.lat4(p4), F.interpolate(p5_td, scale_factor=2.0, mode="nearest")], dim=1))
         p3_td = self.fpn_p3(torch.cat([self.lat3(p3), F.interpolate(p4_td, scale_factor=2.0, mode="nearest")], dim=1))
 
         # Bottom-up
         p4_bu = self.pan_p4(torch.cat([self.pan_p4_down(p3_td), p4_td], dim=1))      # 512
         p5_bu = self.pan_p5(torch.cat([self.pan_p5_down(p4_bu), p5_td], dim=1))      # 1024
-        p6_bu = self.pan_p6(torch.cat([self.pan_p6_down(p5_bu), p6_lat], dim=1))     # 1024
 
-        return p3_td, p4_bu, p5_bu, p6_bu
+        return p3_td, p4_bu, p5_bu
     
 class XAttnGate(nn.Module):
     """
@@ -1046,19 +1033,18 @@ class XAttnGate(nn.Module):
 class DualFusionNeckXAttnL(nn.Module):
     """
     L 规模三路融合颈部（带 FPN + PAN，三路门控融合）：
-      - 维持原始四尺度通道 (P3/P4/P5/P6 = C3c/C4c/C5c/C6c)
-      - 仅在跨尺度交互处做“逐层对齐”（例如 P6->P5, P5->P4, P4->P3 的投影）
+      - 维持原始三尺度通道 (P3/P4/P5 = C3c/C4c/C5c)
+      - 仅在跨尺度交互处做“逐层对齐”（例如 P5->P4, P4->P3 的投影）
       - 在融合前，RGB/IR 各自做 top-down + bottom-up（保持模态独立）
       - 每个尺度构造 (RGB, IR, Concat) 三路候选特征，经注意力门控融合
-      - 输出四层通道分别为 (C3c, C4c, C5c, C6c)，供检测头直接使用
+      - 输出三层通道分别为 (C3c, C4c, C5c)，供检测头直接使用
     """
-    def __init__(self, C3c=256, C4c=512, C5c=1024, C6c=1024,
+    def __init__(self, C3c=256, C4c=512, C5c=1024,
                  gate_mode: str = "channel",  # 或 'scalar'
                  d_model: int = 96,
                  reduction: int = 16):
         super().__init__()
         # 逐层对齐：仅用于跨尺度相加/交互的通道投影
-        self.up6_to5 = ConvBNAct(C6c, C5c, 1, 1)  # P6(C6) -> P5(C5)
         self.up5_to4 = ConvBNAct(C5c, C4c, 1, 1)  # P5(C5) -> P4(C4)
         self.up4_to3 = ConvBNAct(C4c, C3c, 1, 1)  # P4(C4) -> P3(C3)
 
@@ -1066,12 +1052,6 @@ class DualFusionNeckXAttnL(nn.Module):
         self.smooth5 = C2f(C5c, C5c, n=3, shortcut=True)
         self.smooth4 = C2f(C4c, C4c, n=3, shortcut=True)
         self.smooth3 = C2f(C3c, C3c, n=3, shortcut=True)
-
-        # ---------- F6（10x10） ----------
-        self.rgb_mlp6 = MLP(C6c, C6c, r=0.5)
-        self.ir_mlp6  = MLP(C6c, C6c, r=0.5)
-        self.cat_mlp6 = MLP(2 * C6c, 2 * C6c, r=0.5)
-        self.fuse6    = ConvBNAct(2 * C6c, C6c, 1, 1)
 
         # ---------- F5（20x20） ----------
         self.rgb_mlp5 = MLP(C5c, C5c, r=0.5)        # 1024 -> 1024
@@ -1092,13 +1072,11 @@ class DualFusionNeckXAttnL(nn.Module):
         self.fuse3    = ConvBNAct(2 * C3c, C3c, 1, 1)  # 512 -> 256
 
         # 跨模态注意力门控
-        self.gate6 = XAttnGate(C6c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
         self.gate5 = XAttnGate(C5c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
         self.gate4 = XAttnGate(C4c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
         self.gate3 = XAttnGate(C3c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
 
         # 输出整形（保持原通道数不变，便于后续检测头直接使用）
-        self.out6 = ConvBNAct(C6c, C6c, 1, 1)
         self.out5 = ConvBNAct(C5c, C5c, 1, 1)
         self.out4 = ConvBNAct(C4c, C4c, 1, 1)
         self.out3 = ConvBNAct(C3c, C3c, 1, 1)
@@ -1108,24 +1086,20 @@ class DualFusionNeckXAttnL(nn.Module):
         self.pan_c4 = C2f(C4c + C4c, C4c, n=3, shortcut=True)    # concat P3ds(C4) + P4(C4) -> C4
         self.pan_down5 = ConvBNAct(C4c, C5c, 3, 2)               # P4(C4) -> stride2 -> C5
         self.pan_c5 = C2f(C5c + C5c, C5c, n=3, shortcut=True)    # concat P4ds(C5) + P5(C5) -> C5
-        self.pan_down6 = ConvBNAct(C5c, C6c, 3, 2)               # P5(C5) -> stride2 -> C6
-        self.pan_c6 = C2f(C6c + C6c, C6c, n=3, shortcut=True)    # concat P5ds(C6) + P6(C6) -> C6
 
-    def forward(self, rgb_feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-                      ir_feats:  Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]):
-        r3, r4, r5, r6 = rgb_feats
-        i3, i4, i5, i6 = ir_feats
+    def forward(self, rgb_feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                      ir_feats:  Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
+        r3, r4, r5 = rgb_feats
+        i3, i4, i5 = ir_feats
 
         # RGB top-down
-        r6_to5 = self.up6_to5(r6)
-        p5 = self.smooth5(r5 + F.interpolate(r6_to5, scale_factor=2.0, mode="nearest"))
+        p5 = self.smooth5(r5)
         r5_to4 = self.up5_to4(p5)
         p4 = self.smooth4(r4 + F.interpolate(r5_to4, scale_factor=2.0, mode="nearest"))
         p4_to3 = self.up4_to3(p4)
         p3 = self.smooth3(r3 + F.interpolate(p4_to3, scale_factor=2.0, mode="nearest"))
         # IR top-down
-        i6_to5 = self.up6_to5(i6)
-        p5_i = self.smooth5(i5 + F.interpolate(i6_to5, scale_factor=2.0, mode="nearest"))
+        p5_i = self.smooth5(i5)
         i5_to4 = self.up5_to4(p5_i)
         p4_i = self.smooth4(i4 + F.interpolate(i5_to4, scale_factor=2.0, mode="nearest"))
         p4_i_to3 = self.up4_to3(p4_i)
@@ -1134,18 +1108,9 @@ class DualFusionNeckXAttnL(nn.Module):
         # 自底向上 PAN（在融合前，保持模态独立）
         p4_bu = self.pan_c4(torch.cat([self.pan_down4(p3), p4], dim=1))
         p5_bu = self.pan_c5(torch.cat([self.pan_down5(p4_bu), p5], dim=1))
-        p6_bu = self.pan_c6(torch.cat([self.pan_down6(p5_bu), r6], dim=1))
 
         p4_bu_i = self.pan_c4(torch.cat([self.pan_down4(p3_i), p4_i], dim=1))
         p5_bu_i = self.pan_c5(torch.cat([self.pan_down5(p4_bu_i), p5_i], dim=1))
-        p6_bu_i = self.pan_c6(torch.cat([self.pan_down6(p5_bu_i), i6], dim=1))
-
-        # F6
-        r6_m = self.rgb_mlp6(p6_bu)
-        i6_m = self.ir_mlp6(p6_bu_i)
-        c6_m = self.fuse6(self.cat_mlp6(torch.cat([p6_bu, p6_bu_i], dim=1)))
-        w6 = self.gate6(r6_m, i6_m, c6_m)
-        F6 = r6_m * w6[0] + i6_m * w6[1] + c6_m * w6[2]
 
         # F5
         r5_m = self.rgb_mlp5(p5_bu)
@@ -1171,9 +1136,8 @@ class DualFusionNeckXAttnL(nn.Module):
         P3 = self.out3(F3)   # C3c
         P4 = self.out4(F4)   # C4c
         P5 = self.out5(F5)   # C5c
-        P6 = self.out6(F6)   # C6c
 
-        return P3, P4, P5, P6
+        return P3, P4, P5
 
 class DetectHead(nn.Module):
     """
@@ -1622,32 +1586,32 @@ class DualYoloV8L(nn.Module):
         self.ir_backbone  = BackboneV8Large(3)
 
         # 独立的 YOLOv8-L 颈部（参数不共享）
-        self.rgb_neck = YoloV8NeckSingle(C3=256, C4=512, C5=1024, C6=1024)
-        self.ir_neck  = YoloV8NeckSingle(C3=256, C4=512, C5=1024, C6=1024)
+        self.rgb_neck = YoloV8NeckSingle(C3=256, C4=512, C5=1024)
+        self.ir_neck  = YoloV8NeckSingle(C3=256, C4=512, C5=1024)
 
         # 注意: d_model 可设 96/128；'scalar' 更省显存，'channel' 表达力更强
         self.fusion_neck = DualFusionNeckXAttnL(
-            C3c=256, C4c=512, C5c=1024, C6c=1024,
+            C3c=256, C4c=512, C5c=1024,
             gate_mode='channel',
             d_model=96,
             reduction=16
         )
 
-        self.strides = [8, 16, 32, 64]
-        # anchor-free 检测头（融合颈部输出保持 256/512/1024/1024 四尺度通道）
-        self.detect = DetectHead(num_classes, ch=[256, 512, 1024, 1024], reg_max=16, strides=self.strides, img_size=imgsz)
+        self.strides = [8, 16, 32]
+        # anchor-free 检测头（融合颈部输出保持 256/512/1024 三尺度通道）
+        self.detect = DetectHead(num_classes, ch=[256, 512, 1024], reg_max=16, strides=self.strides, img_size=imgsz)
 
     def forward(self, rgb, ir):
         # 双模态各自独立的 backbone + neck
-        r3, r4, r5, r6 = self.rgb_backbone(rgb)
-        i3, i4, i5, i6 = self.ir_backbone(ir)
+        r3, r4, r5 = self.rgb_backbone(rgb)
+        i3, i4, i5 = self.ir_backbone(ir)
 
-        r_feats = self.rgb_neck((r3, r4, r5, r6))
-        i_feats = self.ir_neck((i3, i4, i5, i6))
+        r_feats = self.rgb_neck((r3, r4, r5))
+        i_feats = self.ir_neck((i3, i4, i5))
 
         # 融合颈部在 neck 输出处进行跨模态门控
-        F3, F4, F5, F6 = self.fusion_neck(r_feats, i_feats)
-        outs = self.detect([F3, F4, F5, F6])
+        F3, F4, F5 = self.fusion_neck(r_feats, i_feats)
+        outs = self.detect([F3, F4, F5])
         return outs
 
 def decode_predictions(preds, strides, conf_thr=0.25, img_size=640, reg_max=16):
@@ -2100,12 +2064,12 @@ def get_args():
     ap.add_argument("--val_csv",   type=str, default="../LLVIP/llvip_test_paths.csv")
     ap.add_argument("--imgsz",     type=int, default=640)
     ap.add_argument("--epochs",    type=int, default=200)
-    ap.add_argument("--batch",     type=int, default=12)
+    ap.add_argument("--batch",     type=int, default=14)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--lr",        type=float, default=1e-3)
     ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
-    ap.add_argument("--logdir",    type=str, default="./runs/0116_fixmap")
+    ap.add_argument("--logdir",    type=str, default="./runs/0118_rmp6")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
     ap.add_argument("--gpus",      type=str, default="", help="单进程多 GPU（DataParallel），例如：--gpus 0,1,2。推荐优先用 DDP(torchrun)。")
