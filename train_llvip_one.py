@@ -937,97 +937,40 @@ class YoloV8NeckSingle(nn.Module):
     
 class XAttnGate(nn.Module):
     """
-    轻量跨模态注意力门控：
-      - 输入三路特征 (r, i, c)，shape=(B,C,H,W)，C 为该尺度目标通道
-      - 先做 GAP 得到 tokens: t_r, t_i, t_c ∈ R^{B×C}
-      - 线性映射到 d_model 维；Query=concat token，Key/Value=[r,i,c] 三个 token
-      - 得到注意力权重 α∈R^{B×3}，经 softmax 作为三路门控
-
-    gate_mode:
-      - 'scalar'  : 返回三路标量权重 (B,3,1,1)
-      - 'channel' : 先用注意力输出 O ∈ R^{B×d} 经过 MLP -> 3C，再按路径维 softmax，返回 (B,3,C,1,1)
+    稳定版跨模态门控（按用户定义的结构）：
+      1) 由 r,i,c 生成 [r, i, c, i-r] 在通道维拼接 -> (B, 4C, H, W)
+      2) 3x3 Conv + BN + SiLU
+      3) 1x1 Conv 将 4C 映射到 3C（零初始化）
+      4) reshape 为 (B, 3, C, H, W) 后做 softmax（带温度）
     """
-    def __init__(self, channels: int, d_model: int = 64, gate_mode: str = "scalar",
-                 reduction: int = 16, dropout: float = 0.0):
+    def __init__(self, channels: int, temperature: float = 2.0):
         super().__init__()
-        assert gate_mode in ("scalar", "channel")
         self.channels = channels
-        self.d_model = d_model
-        self.gate_mode = gate_mode
-
-        # 三个路径的可学习路径嵌入（帮助区分 RGB/IR/Concat）
-        self.path_embed = nn.Parameter(torch.zeros(3, d_model))
-
-        # token 映射
-        self.proj_q = nn.Linear(channels, d_model, bias=True)  # for concat token
-        self.proj_k = nn.Linear(channels, d_model, bias=True)  # shared for [r,i,c]
-        self.proj_v = nn.Linear(channels, d_model, bias=True)
-
-        self.scale = d_model ** -0.5
-        self.dp = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-
-        if gate_mode == "channel":
-            hid = max(8, channels // reduction)
-            # 由注意力输出 O(d_model) 生成三路逐通道权重 (3C)
-            self.mlp = nn.Sequential(
-                nn.Linear(d_model, hid, bias=True),
-                nn.SiLU(inplace=True),
-                nn.Linear(hid, 3 * channels, bias=True),
-            )
-            # 让初始权重尽量接近均分
-            nn.init.zeros_(self.mlp[-1].weight)
-            nn.init.zeros_(self.mlp[-1].bias)
-
-        # 让起始注意力更接近均匀
-        nn.init.normal_(self.path_embed, std=1e-4)
+        self.temperature = float(temperature)
+        self.conv3 = nn.Conv2d(4 * channels, 4 * channels, kernel_size=3, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(4 * channels)
+        self.act = nn.SiLU(inplace=True)
+        self.conv1 = nn.Conv2d(4 * channels, 3 * channels, kernel_size=1, padding=0, bias=True)
+        nn.init.zeros_(self.conv1.weight)
+        nn.init.zeros_(self.conv1.bias)
 
     def forward(self, r: torch.Tensor, i: torch.Tensor, c: torch.Tensor):
         """
         Inputs: r, i, c: (B, C, H, W)
         Returns:
-          - scalar: (wr, wi, wc) each (B,1,1,1)
-          - channel: (Wr, Wi, Wc) each (B, C, 1, 1)
+          w1, w2, w3: (B, C, H, W)
         """
         B, C, H, W = r.shape
-        # GAP tokens: (B, C)
-        tr = F.adaptive_avg_pool2d(r, 1).flatten(1)
-        ti = F.adaptive_avg_pool2d(i, 1).flatten(1)
-        tc = F.adaptive_avg_pool2d(c, 1).flatten(1)
-
-        # 线性映射到 d_model
-        q = self.proj_q(tc)                   # (B, d)
-        k = torch.stack([self.proj_k(tr),     # (B, 3, d)
-                         self.proj_k(ti),
-                         self.proj_k(tc)], dim=1)
-        v = torch.stack([self.proj_v(tr),     # (B, 3, d)
-                         self.proj_v(ti),
-                         self.proj_v(tc)], dim=1)
-
-        # 加路径嵌入
-        k = k + self.path_embed.view(1, 3, self.d_model)
-        v = v + self.path_embed.view(1, 3, self.d_model)
-
-        # 注意力 logits: (B, 1, d) x (B, d, 3) -> (B, 1, 3)
-        attn_logits = (q.unsqueeze(1) @ k.transpose(1, 2)) * self.scale
-        attn = torch.softmax(attn_logits, dim=-1).squeeze(1)  # (B, 3)
-        attn = self.dp(attn)
-
-        if self.gate_mode == "scalar":
-            # 标量权重 (wr, wi, wc) -> (B,1,1,1)
-            wr = attn[:, 0].view(B, 1, 1, 1)
-            wi = attn[:, 1].view(B, 1, 1, 1)
-            wc = attn[:, 2].view(B, 1, 1, 1)
-            return wr, wi, wc
-        else:
-            # channel 权重：先得到注意力输出 O = attn @ V ∈ (B, d)
-            O = (attn.unsqueeze(1) @ v).squeeze(1)  # (B, d)
-            g = self.mlp(O)                         # (B, 3C)
-            g = g.view(B, 3, C)                     # (B,3,C)
-            g = torch.softmax(g, dim=1)             # 沿路径维 softmax
-            Wr = g[:, 0].unsqueeze(-1).unsqueeze(-1)  # (B,C,1,1)
-            Wi = g[:, 1].unsqueeze(-1).unsqueeze(-1)
-            Wc = g[:, 2].unsqueeze(-1).unsqueeze(-1)
-            return Wr, Wi, Wc
+        feat = torch.cat([r, i, c, i - r], dim=1)  # (B, 4C, H, W)
+        x = self.act(self.bn3(self.conv3(feat)))
+        x = self.conv1(x)  # (B, 3C, H, W)
+        x = x.view(B, 3, C, H, W)
+        x = x / max(self.temperature, 1e-6)
+        x = torch.softmax(x, dim=1)
+        w1 = x[:, 0]
+        w2 = x[:, 1]
+        w3 = x[:, 2]
+        return w1, w2, w3
 
 
 class DualFusionNeckXAttnL(nn.Module):
@@ -1039,10 +982,7 @@ class DualFusionNeckXAttnL(nn.Module):
       - 每个尺度构造 (RGB, IR, Concat) 三路候选特征，经注意力门控融合
       - 输出三层通道分别为 (C3c, C4c, C5c)，供检测头直接使用
     """
-    def __init__(self, C3c=256, C4c=512, C5c=1024,
-                 gate_mode: str = "channel",  # 或 'scalar'
-                 d_model: int = 96,
-                 reduction: int = 16):
+    def __init__(self, C3c=256, C4c=512, C5c=1024):
         super().__init__()
         # 逐层对齐：仅用于跨尺度相加/交互的通道投影
         self.up5_to4 = ConvBNAct(C5c, C4c, 1, 1)  # P5(C5) -> P4(C4)
@@ -1072,9 +1012,9 @@ class DualFusionNeckXAttnL(nn.Module):
         self.fuse3    = ConvBNAct(2 * C3c, C3c, 1, 1)  # 512 -> 256
 
         # 跨模态注意力门控
-        self.gate5 = XAttnGate(C5c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
-        self.gate4 = XAttnGate(C4c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
-        self.gate3 = XAttnGate(C3c, d_model=d_model, gate_mode=gate_mode, reduction=reduction)
+        self.gate5 = XAttnGate(C5c)
+        self.gate4 = XAttnGate(C4c)
+        self.gate3 = XAttnGate(C3c)
 
         # 输出整形（保持原通道数不变，便于后续检测头直接使用）
         self.out5 = ConvBNAct(C5c, C5c, 1, 1)
@@ -1589,12 +1529,8 @@ class DualYoloV8L(nn.Module):
         self.rgb_neck = YoloV8NeckSingle(C3=256, C4=512, C5=1024)
         self.ir_neck  = YoloV8NeckSingle(C3=256, C4=512, C5=1024)
 
-        # 注意: d_model 可设 96/128；'scalar' 更省显存，'channel' 表达力更强
         self.fusion_neck = DualFusionNeckXAttnL(
-            C3c=256, C4c=512, C5c=1024,
-            gate_mode='channel',
-            d_model=96,
-            reduction=16
+            C3c=256, C4c=512, C5c=1024
         )
 
         self.strides = [8, 16, 32]
@@ -2064,12 +2000,12 @@ def get_args():
     ap.add_argument("--val_csv",   type=str, default="../LLVIP/llvip_test_paths.csv")
     ap.add_argument("--imgsz",     type=int, default=640)
     ap.add_argument("--epochs",    type=int, default=200)
-    ap.add_argument("--batch",     type=int, default=14)
+    ap.add_argument("--batch",     type=int, default=20)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--lr",        type=float, default=1e-3)
     ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
-    ap.add_argument("--logdir",    type=str, default="./runs/0118_rmp6")
+    ap.add_argument("--logdir",    type=str, default="./runs/0122_warm")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
     ap.add_argument("--gpus",      type=str, default="", help="单进程多 GPU（DataParallel），例如：--gpus 0,1,2。推荐优先用 DDP(torchrun)。")
