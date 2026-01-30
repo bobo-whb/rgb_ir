@@ -4,6 +4,7 @@ import math
 import time
 import random
 import logging
+import copy
 from typing import List, Tuple, Dict, Optional
 
 import numpy as np
@@ -799,6 +800,67 @@ def collate_fn(batch):
     rgbs = torch.stack(rgbs,0)
     irs  = torch.stack(irs ,0)
     return rgbs, irs, list(targets), names
+
+class ModelEMA:
+    """
+    Exponential Moving Average of model weights (YOLOv8-style).
+    """
+    def __init__(self, model: nn.Module, decay: float = 0.9999, tau: float = 2000.0, updates: int = 0):
+        self.ema = copy.deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+        self.decay = float(decay)
+        self.tau = float(tau)
+        self.updates = int(updates)
+
+    def update(self, model: nn.Module):
+        self.updates += 1
+        d = self.decay * (1.0 - math.exp(-self.updates / max(self.tau, 1.0)))
+        with torch.no_grad():
+            msd = model.state_dict()
+            for k, v in self.ema.state_dict().items():
+                if v.dtype.is_floating_point:
+                    v.copy_(v * d + msd[k].detach() * (1.0 - d))
+                else:
+                    v.copy_(msd[k])
+
+def build_optimizer(model: nn.Module, args):
+    """
+    YOLOv8-like optimizer parameter groups:
+      - g0: weights with decay
+      - g1: norm weights without decay
+      - g2: biases without decay
+    """
+    g0, g1, g2 = [], [], []
+    for module_name, m in model.named_modules():
+        for param_name, p in m.named_parameters(recurse=False):
+            if not p.requires_grad:
+                continue
+            if param_name == "bias":
+                g2.append(p)
+            elif isinstance(m, nn.BatchNorm2d) or "bn" in module_name.lower():
+                g1.append(p)
+            else:
+                g0.append(p)
+
+    groups = [
+        {"params": g0, "weight_decay": args.weight_decay},
+        {"params": g1, "weight_decay": 0.0},
+        {"params": g2, "weight_decay": 0.0},
+    ]
+
+    opt = args.optimizer.lower()
+    if opt == "sgd":
+        optimizer = torch.optim.SGD(groups, lr=args.lr0, momentum=args.momentum, nesterov=True)
+    elif opt == "adamw":
+        optimizer = torch.optim.AdamW(groups, lr=args.lr0, betas=(0.9, 0.999), weight_decay=args.weight_decay)
+    else:
+        raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+    return optimizer
+
+def cosine_lr_factor(progress: float, lrf: float) -> float:
+    # progress in [0,1]
+    return lrf + 0.5 * (1.0 - lrf) * (1.0 + math.cos(math.pi * progress))
 
 # -------- Model (YOLOv8-like backbone/neck: C2f) --------
 class ConvBNAct(nn.Module):
@@ -1781,9 +1843,9 @@ def train(args):
 
     # Model
     model = DualYoloV8L(num_classes=len(CANONICAL_CLASSES), imgsz=args.imgsz).to(device)
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
+    optim = build_optimizer(model, args)
     criterion = YoloLoss(len(CANONICAL_CLASSES), reg_max=16)
+    ema = ModelEMA(model, decay=args.ema_decay, tau=args.ema_tau) if args.ema else None
 
     # ---------- 自动批大小估计，尽量吃满显存但不 OOM ----------
     if device.type == "cuda" and args.auto_batch and (not distributed or is_main_process()):
@@ -1877,6 +1939,16 @@ def train(args):
         if device.type == "cuda" and len(gpus) > 1:
             model = nn.DataParallel(model, device_ids=gpus)
 
+    nb = len(train_loader)
+    warmup_iters = max(1, int(args.warmup_epochs * nb)) if args.warmup_epochs > 0 else 0
+    if (not distributed) or is_main_process():
+        logger.info(
+            f"Recipe | opt={args.optimizer} lr0={args.lr0} lrf={args.lrf} "
+            f"momentum={args.momentum} wd={args.weight_decay} "
+            f"warmup_epochs={args.warmup_epochs} warmup_iters={warmup_iters} "
+            f"ema={'on' if ema else 'off'}"
+        )
+
     best_map = 0.0
     mosaic_closed = False
     for epoch in range(1, args.epochs+1):
@@ -1893,8 +1965,26 @@ def train(args):
         raw_model = unwrap_model(model)
         t0 = time.time()
         loss_meter = 0.0; meter = {"l_box":0.0,"l_cls":0.0,"l_dfl":0.0}
-        nb = 0
-        for rgbs, irs, targets, names in train_loader:
+        nb_iter = 0
+        for i, (rgbs, irs, targets, names) in enumerate(train_loader):
+            # ---- YOLOv8-style warmup + cosine LR ----
+            if warmup_iters > 0 and (epoch - 1) * nb + i < warmup_iters:
+                ni = (epoch - 1) * nb + i
+                xi = ni / warmup_iters
+                warmup_lr = args.lr0 * cosine_lr_factor(0.0, args.lrf)
+                for gi, pg in enumerate(optim.param_groups):
+                    if gi == 2:
+                        pg["lr"] = args.warmup_bias_lr + xi * (warmup_lr - args.warmup_bias_lr)
+                    else:
+                        pg["lr"] = xi * warmup_lr
+                    if "momentum" in pg:
+                        pg["momentum"] = args.warmup_momentum + xi * (args.momentum - args.warmup_momentum)
+            else:
+                progress = (epoch - 1 + i / max(nb, 1)) / max(args.epochs, 1)
+                lr = args.lr0 * cosine_lr_factor(progress, args.lrf)
+                for pg in optim.param_groups:
+                    pg["lr"] = lr
+
             rgbs = rgbs.to(device, non_blocking=True if device.type=='cuda' else False)
             irs  = irs.to(device,  non_blocking=True if device.type=='cuda' else False)
             tgts = [{k:v.to(device) if torch.is_tensor(v) else v for k,v in t.items()} for t in targets]
@@ -1906,15 +1996,16 @@ def train(args):
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             optim.step()
+            if ema is not None:
+                ema.update(unwrap_model(model))
 
-            loss_meter += loss.item(); nb += 1
+            loss_meter += loss.item(); nb_iter += 1
             for k in meter: meter[k]+= parts[k]
 
-        scheduler.step()
         if distributed:
             # reduce metrics for logging
             t = torch.tensor(
-                [loss_meter, meter["l_box"], meter["l_cls"], meter["l_dfl"], float(nb)],
+                [loss_meter, meter["l_box"], meter["l_cls"], meter["l_dfl"], float(nb_iter)],
                 device=device,
                 dtype=torch.float32,
             )
@@ -1926,8 +2017,8 @@ def train(args):
             meter["l_dfl"] = t[3].item() / denom
         dt = time.time()-t0
         if not distributed:
-            loss_meter /= max(nb,1)
-            for k in meter: meter[k] /= max(nb,1)
+            loss_meter /= max(nb_iter,1)
+            for k in meter: meter[k] /= max(nb_iter,1)
         if (not distributed) or is_main_process():
             logger.info(f"Epoch {epoch}/{args.epochs} | loss={loss_meter:.4f} (box {meter['l_box']:.2f} cls {meter['l_cls']:.2f} dfl {meter['l_dfl']:.2f}) | {dt:.1f}s")
 
@@ -1936,14 +2027,15 @@ def train(args):
             dist.barrier()
 
         if epoch >= 20 and ((not distributed) or is_main_process()):
-            model.eval()
             raw_model = unwrap_model(model)
+            eval_model = ema.ema if ema is not None else raw_model
+            eval_model.eval()
             preds_all = []; gts_all = []
             with torch.no_grad():
                 for rgbs, irs, targets, names in val_loader:
                     rgbs = rgbs.to(device); irs = irs.to(device)
-                    outs = model(rgbs, irs)
-                    dets = raw_model.detect.decode_dets(outs, conf_thr=args.conf_thres)
+                    outs = eval_model(rgbs, irs)
+                    dets = eval_model.detect.decode_dets(outs, conf_thr=args.conf_thres)
                     dets = [nms_axis_aligned(d, iou_thr=args.nms_iou, topk=args.max_det) for d in dets]
                     preds_all.extend(dets)
                     for t in targets:
@@ -1965,15 +2057,18 @@ def train(args):
             if mAP50 > best_map:
                 best_map = mAP50
                 save_path = os.path.join(args.logdir, "best.pt")
-                torch.save({
-                    "model": raw_model.state_dict(),
+                state = {
+                    "model": (ema.ema.state_dict() if ema is not None else raw_model.state_dict()),
                     "classes": CANONICAL_CLASSES,
                     "epoch": epoch,
                     "metrics": {
                         "P": P, "R": R, "mAP50": mAP50,
                         "AP50_per_class": ap_table
                     }
-                }, save_path)
+                }
+                if ema is not None:
+                    state["model_raw"] = raw_model.state_dict()
+                torch.save(state, save_path)
                 logger.info(f"Saved best to {save_path} (mAP50={mAP50:.4f})")
         elif (not distributed) or is_main_process():
             logger.info(f"Epoch {epoch}/{args.epochs} | Skipping evaluation (will start from epoch 20)")
@@ -1986,7 +2081,12 @@ def train(args):
 
     if (not distributed) or is_main_process():
         final_path = os.path.join(args.logdir, "last.pt")
-        torch.save({"model": unwrap_model(model).state_dict(), "classes": CANONICAL_CLASSES}, final_path)
+        raw_model = unwrap_model(model)
+        state = {"model": (ema.ema.state_dict() if ema is not None else raw_model.state_dict()),
+                 "classes": CANONICAL_CLASSES}
+        if ema is not None:
+            state["model_raw"] = raw_model.state_dict()
+        torch.save(state, final_path)
         logger.info(f"Training finished. Final weights saved to {final_path}")
 
     if distributed and is_dist_avail_and_initialized():
@@ -2002,10 +2102,23 @@ def get_args():
     ap.add_argument("--epochs",    type=int, default=200)
     ap.add_argument("--batch",     type=int, default=20)
     ap.add_argument("--num_workers", type=int, default=4)
-    ap.add_argument("--lr",        type=float, default=1e-3)
+    # ---- YOLOv8-like recipe ----
+    ap.add_argument("--lr0",       type=float, default=0.01, help="初始学习率 (YOLOv8 默认 0.01)")
+    ap.add_argument("--lrf",       type=float, default=0.01, help="最终学习率比例 (lr_final = lr0 * lrf)")
+    ap.add_argument("--momentum",  type=float, default=0.937, help="SGD momentum (YOLOv8 默认 0.937)")
+    ap.add_argument("--weight_decay", type=float, default=5e-4, help="权重衰减 (YOLOv8 默认 5e-4)")
+    ap.add_argument("--warmup_epochs", type=float, default=3.0, help="warmup 轮数 (YOLOv8 默认 3.0)")
+    ap.add_argument("--warmup_momentum", type=float, default=0.8, help="warmup 初始 momentum")
+    ap.add_argument("--warmup_bias_lr", type=float, default=0.1, help="bias warmup 起始学习率")
+    ap.add_argument("--optimizer", type=str, default="SGD", help="优化器: SGD 或 AdamW")
+    ap.add_argument("--ema", action="store_true", default=True, help="启用 EMA (默认开启)")
+    ap.add_argument("--no-ema", dest="ema", action="store_false", help="关闭 EMA")
+    ap.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay (YOLOv8 默认 0.9999)")
+    ap.add_argument("--ema_tau", type=float, default=2000.0, help="EMA tau (YOLOv8 默认 2000)")
+    ap.add_argument("--lr",        type=float, default=None, help="兼容旧参数：等价于 --lr0")
     ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
-    ap.add_argument("--logdir",    type=str, default="./runs/0122_warm")
+    ap.add_argument("--logdir",    type=str, default="./runs/0126_warm")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
     ap.add_argument("--gpus",      type=str, default="", help="单进程多 GPU（DataParallel），例如：--gpus 0,1,2。推荐优先用 DDP(torchrun)。")
@@ -2014,7 +2127,10 @@ def get_args():
     ap.add_argument("--close_mosaic",  type=int, default=10, help="训练最后 N 个 epoch 关闭 mosaic/mixup（YOLOv8 默认 close_mosaic=10）")
     ap.add_argument("--auto_batch", action="store_true", help="自动估算批大小以尽量占满显存")
     ap.add_argument("--max_vram_frac", type=float, default=0.9, help="自动批大小的目标显存占用比例 (0-1)")
-    return ap.parse_args()
+    args = ap.parse_args()
+    if args.lr is not None:
+        args.lr0 = float(args.lr)
+    return args
 
 if __name__ == "__main__":
     args = get_args()
