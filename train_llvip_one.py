@@ -409,7 +409,7 @@ def parse_shared_xml(xml_path: str) -> Tuple[List[List[float]], List[int]]:
 class RGBIRDetDataset(Dataset):
     def __init__(self, csv_path: str, imgsz: int = 640, augment: bool = True,
                  # ---- Augment defaults aligned to YOLOv8 ----
-                 mosaic: bool = True, mosaic_prob: float = 1.0, mixup_prob: float = 0.0,
+                 mosaic: bool = True, mosaic_prob: float = 1.0, mixup_prob: float = 0.1,
                  mosaic_scale: Tuple[float, float] = (0.5, 1.5),
                  hsv_gain: Tuple[float, float, float] = (0.015, 0.7, 0.4),
                  degrees: float = 0.0, translate: float = 0.1, scale: float = 0.5,
@@ -463,7 +463,22 @@ class RGBIRDetDataset(Dataset):
         ann_path = it["annotation_path"]
 
         if self.augment:
-            rgb_np, ir_np, boxes_np, labels_np = self._build_train_sample(idx)
+            rgb_np, ir_np, boxes_np, labels_np, _ = self._build_train_sample(idx)
+
+            # ---- Geometry first (mosaic/mixup -> random perspective -> flip) ----
+            boxes_np = boxes_np.astype(np.float32) if boxes_np is not None else np.zeros((0, 4), np.float32)
+            rgb_np, ir_np, boxes_np, labels_np = self._random_perspective_np(
+                rgb_np, ir_np, boxes_np, labels_np,
+                degrees=self.degrees, translate=self.translate, scale=self.scale,
+                shear=self.shear, perspective=self.perspective,
+            )
+            rgb_np, ir_np, boxes_np = self._random_flip_np(rgb_np, ir_np, boxes_np)
+
+            # ---- Photometric after geometry (avoid jittering padding) ----
+            rgb_np, ir_np = self._apply_hsv(rgb_np, ir_np)
+            rgb_np, ir_np = self._spectral_augment(rgb_np, ir_np)
+
+            # ---- Resize/letterbox last to keep fixed size ----
             rgb = Image.fromarray(rgb_np)
             ir = Image.fromarray(ir_np)
         else:
@@ -482,23 +497,9 @@ class RGBIRDetDataset(Dataset):
         else:
             boxes_scaled = boxes_np
 
-        # ---- Apply YOLOv8-like augmentations after letterbox (same transform for RGB/IR) ----
         if self.augment:
-            rgb_np2 = np.array(rgb, dtype=np.uint8)
-            ir_np2  = np.array(ir,  dtype=np.uint8)
-            boxes_scaled = boxes_scaled.astype(np.float32) if boxes_scaled is not None else np.zeros((0, 4), np.float32)
-
-            rgb_np2, ir_np2, boxes_scaled, labels_np = self._random_perspective_np(
-                rgb_np2, ir_np2, boxes_scaled, labels_np,
-                degrees=self.degrees, translate=self.translate, scale=self.scale,
-                shear=self.shear, perspective=self.perspective,
-            )
-            rgb_np2, ir_np2, boxes_scaled = self._random_flip_np(rgb_np2, ir_np2, boxes_scaled)
-            rgb_np2, ir_np2 = self._apply_hsv(rgb_np2, ir_np2)
-            rgb_np2, ir_np2 = self._spectral_augment(rgb_np2, ir_np2)
-
-            rgb_t = torch.from_numpy(rgb_np2).permute(2, 0, 1).float() / 255.0
-            ir_t  = torch.from_numpy(ir_np2 ).permute(2, 0, 1).float() / 255.0
+            rgb_t = torch.from_numpy(np.array(rgb, dtype=np.uint8)).permute(2, 0, 1).float() / 255.0
+            ir_t  = torch.from_numpy(np.array(ir,  dtype=np.uint8)).permute(2, 0, 1).float() / 255.0
             boxes_final = boxes_scaled
             labels_final = labels_np
         else:
@@ -515,7 +516,9 @@ class RGBIRDetDataset(Dataset):
         return rgb_t, ir_t, target, os.path.basename(rgb_path)
 
     def _build_train_sample(self, idx: int):
+        mosaic_used = False
         if self.mosaic and random.random() < self.mosaic_prob:
+            mosaic_used = True
             rgb, ir, boxes, labels = self._load_mosaic_sample(idx)
             if self.mixup_prob > 0 and random.random() < self.mixup_prob:
                 mix_idx = random.randrange(len(self.items))
@@ -523,7 +526,7 @@ class RGBIRDetDataset(Dataset):
                 rgb, ir, boxes, labels = self._mixup_samples(rgb, ir, boxes, labels, rgb2, ir2, boxes2, labels2)
         else:
             rgb, ir, boxes, labels = self._load_sample_numpy(idx)
-        return rgb, ir, boxes, labels
+        return rgb, ir, boxes, labels, mosaic_used
 
     def _mixup_samples(self, rgb1, ir1, boxes1, labels1, rgb2, ir2, boxes2, labels2):
         lam = np.random.beta(8.0, 8.0)
@@ -1838,7 +1841,13 @@ def train(args):
     torch.manual_seed(seed); np.random.seed(seed); random.seed(seed)
 
     # Data
-    train_ds = RGBIRDetDataset(args.train_csv, imgsz=args.imgsz, augment=True)
+    train_ds = RGBIRDetDataset(
+        args.train_csv,
+        imgsz=args.imgsz,
+        augment=True,
+        mosaic_prob=args.mosaic_prob,
+        mixup_prob=args.mixup_prob,
+    )
     val_ds   = RGBIRDetDataset(args.val_csv,   imgsz=args.imgsz, augment=False)
 
     # Model
@@ -2118,13 +2127,15 @@ def get_args():
     ap.add_argument("--lr",        type=float, default=None, help="兼容旧参数：等价于 --lr0")
     ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
-    ap.add_argument("--logdir",    type=str, default="./runs/0126_warm")
+    ap.add_argument("--logdir",    type=str, default="./runs/0130_aug")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
     ap.add_argument("--gpus",      type=str, default="", help="单进程多 GPU（DataParallel），例如：--gpus 0,1,2。推荐优先用 DDP(torchrun)。")
     ap.add_argument("--local_rank", type=int, default=-1, help=argparse.SUPPRESS)
     ap.add_argument("--max_det",       type=int, default=300)
     ap.add_argument("--close_mosaic",  type=int, default=10, help="训练最后 N 个 epoch 关闭 mosaic/mixup（YOLOv8 默认 close_mosaic=10）")
+    ap.add_argument("--mosaic_prob",   type=float, default=0.8, help="mosaic 概率（训练集）")
+    ap.add_argument("--mixup_prob",    type=float, default=0.1, help="mixup 概率（训练集，仅在 mosaic 分支生效）")
     ap.add_argument("--auto_batch", action="store_true", help="自动估算批大小以尽量占满显存")
     ap.add_argument("--max_vram_frac", type=float, default=0.9, help="自动批大小的目标显存占用比例 (0-1)")
     args = ap.parse_args()
