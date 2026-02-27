@@ -412,7 +412,7 @@ class RGBIRDetDataset(Dataset):
                  mosaic: bool = True, mosaic_prob: float = 1.0, mixup_prob: float = 0.1,
                  mosaic_scale: Tuple[float, float] = (0.5, 1.5),
                  hsv_gain: Tuple[float, float, float] = (0.015, 0.7, 0.4),
-                 degrees: float = 0.0, translate: float = 0.1, scale: float = 0.5,
+                 degrees: float = 0.0, translate: float = 0.1, scale: float = 0.3,
                  shear: float = 0.0, perspective: float = 0.0,
                  # project-specific spectral mixing (disabled by default to match YOLOv8)
                  spectral_prob: float = 0.0, spectral_strength: float = 0.0,
@@ -1960,7 +1960,33 @@ def train(args):
 
     best_map = 0.0
     mosaic_closed = False
+    # ---- Staged augmentation schedule ----
+    # Keep first 40 epochs unchanged, then ramp up augmentation from epoch 41 to 120.
+    ramp_start = 40
+    ramp_end = 120
+    base_mosaic = float(train_ds.mosaic_prob)
+    base_mixup = float(train_ds.mixup_prob)
+    base_scale = float(train_ds.scale)
+    target_mosaic = 0.8
+    target_mixup = 0.1
+    target_scale = 0.5
     for epoch in range(1, args.epochs+1):
+        # ---- Staged augmentation schedule ----
+        if not mosaic_closed:
+            if epoch <= ramp_start:
+                train_ds.mosaic_prob = base_mosaic
+                train_ds.mixup_prob = base_mixup
+                train_ds.scale = base_scale
+            elif epoch <= ramp_end:
+                t = (epoch - ramp_start) / max((ramp_end - ramp_start), 1)
+                train_ds.mosaic_prob = base_mosaic + t * (target_mosaic - base_mosaic)
+                train_ds.mixup_prob = base_mixup + t * (target_mixup - base_mixup)
+                train_ds.scale = base_scale + t * (target_scale - base_scale)
+            else:
+                train_ds.mosaic_prob = target_mosaic
+                train_ds.mixup_prob = target_mixup
+                train_ds.scale = target_scale
+
         # YOLOv8-style: disable mosaic/mixup in the last N epochs
         if (not mosaic_closed) and getattr(args, "close_mosaic", 0) and epoch >= (args.epochs - int(args.close_mosaic) + 1):
             train_ds.mosaic = False
@@ -2108,7 +2134,7 @@ def get_args():
     ap.add_argument("--train_csv", type=str, default="../LLVIP/llvip_train_paths.csv")
     ap.add_argument("--val_csv",   type=str, default="../LLVIP/llvip_test_paths.csv")
     ap.add_argument("--imgsz",     type=int, default=640)
-    ap.add_argument("--epochs",    type=int, default=200)
+    ap.add_argument("--epochs",    type=int, default=220)
     ap.add_argument("--batch",     type=int, default=20)
     ap.add_argument("--num_workers", type=int, default=4)
     # ---- YOLOv8-like recipe ----
@@ -2127,15 +2153,15 @@ def get_args():
     ap.add_argument("--lr",        type=float, default=None, help="兼容旧参数：等价于 --lr0")
     ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
-    ap.add_argument("--logdir",    type=str, default="./runs/0130_aug")
+    ap.add_argument("--logdir",    type=str, default="./runs/0204_stage")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
     ap.add_argument("--gpus",      type=str, default="", help="单进程多 GPU（DataParallel），例如：--gpus 0,1,2。推荐优先用 DDP(torchrun)。")
     ap.add_argument("--local_rank", type=int, default=-1, help=argparse.SUPPRESS)
     ap.add_argument("--max_det",       type=int, default=300)
-    ap.add_argument("--close_mosaic",  type=int, default=10, help="训练最后 N 个 epoch 关闭 mosaic/mixup（YOLOv8 默认 close_mosaic=10）")
-    ap.add_argument("--mosaic_prob",   type=float, default=0.8, help="mosaic 概率（训练集）")
-    ap.add_argument("--mixup_prob",    type=float, default=0.1, help="mixup 概率（训练集，仅在 mosaic 分支生效）")
+    ap.add_argument("--close_mosaic",  type=int, default=20, help="训练最后 N 个 epoch 关闭 mosaic/mixup（YOLOv8 默认 close_mosaic=10）")
+    ap.add_argument("--mosaic_prob",   type=float, default=0.6, help="mosaic 概率（训练集）")
+    ap.add_argument("--mixup_prob",    type=float, default=0.0, help="mixup 概率（训练集，仅在 mosaic 分支生效）")
     ap.add_argument("--auto_batch", action="store_true", help="自动估算批大小以尽量占满显存")
     ap.add_argument("--max_vram_frac", type=float, default=0.9, help="自动批大小的目标显存占用比例 (0-1)")
     args = ap.parse_args()
