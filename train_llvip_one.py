@@ -5,6 +5,7 @@ import time
 import random
 import logging
 import copy
+import warnings
 from typing import List, Tuple, Dict, Optional
 
 import numpy as np
@@ -1413,7 +1414,7 @@ class TaskAlignedAssigner(nn.Module):
 
             # score: (metric / max_metric_per_gt) * iou
             score = (align_metric[fg_inds, gti] / metric_max[gti]) * ious[fg_inds, gti]
-            score = score.clamp(min=0.0, max=1.0)
+            score = score.clamp(min=0.0, max=1.0).to(dtype=target_scores.dtype)
             tcls = gt_labels[gti].clamp(min=0, max=num_classes - 1)
             target_scores[fg_inds, tcls] = score
 
@@ -1855,6 +1856,17 @@ def train(args):
     optim = build_optimizer(model, args)
     criterion = YoloLoss(len(CANONICAL_CLASSES), reg_max=16)
     ema = ModelEMA(model, decay=args.ema_decay, tau=args.ema_tau) if args.ema else None
+    amp_enabled = bool(args.amp and device.type == "cuda")
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
+    scaler = torch.amp.GradScaler(amp_device, enabled=amp_enabled)
+
+    # PyTorch<=2.4 DataParallel 内部仍调用旧 autocast API，这里抑制该已知 FutureWarning。
+    warnings.filterwarnings(
+        "ignore",
+        message=r"`torch\.cuda\.amp\.autocast\(args\.\.\.\)` is deprecated\.",
+        category=FutureWarning,
+        module=r"torch\.nn\.parallel\.parallel_apply",
+    )
 
     # ---------- 自动批大小估计，尽量吃满显存但不 OOM ----------
     if device.type == "cuda" and args.auto_batch and (not distributed or is_main_process()):
@@ -1878,8 +1890,9 @@ def train(args):
             model.train()
             optim.zero_grad(set_to_none=True)
             torch.cuda.reset_peak_memory_stats(device)
-            out_tmp = model(rgb_b, ir_b)
-            loss_tmp, _ = criterion(out_tmp, tgt_b, model.strides)
+            with torch.amp.autocast(device_type=amp_device, enabled=amp_enabled):
+                out_tmp = model(rgb_b, ir_b)
+                loss_tmp, _ = criterion(out_tmp, tgt_b, model.strides)
             loss_tmp.backward()
             peak = torch.cuda.max_memory_allocated(device)
             mem_per_sample = peak / base_b
@@ -1955,7 +1968,7 @@ def train(args):
             f"Recipe | opt={args.optimizer} lr0={args.lr0} lrf={args.lrf} "
             f"momentum={args.momentum} wd={args.weight_decay} "
             f"warmup_epochs={args.warmup_epochs} warmup_iters={warmup_iters} "
-            f"ema={'on' if ema else 'off'}"
+            f"ema={'on' if ema else 'off'} amp={'on' if amp_enabled else 'off'}"
         )
 
     best_map = 0.0
@@ -1964,28 +1977,42 @@ def train(args):
     # Keep first 40 epochs unchanged, then ramp up augmentation from epoch 41 to 120.
     ramp_start = 40
     ramp_end = 120
+    mixup_ramp_start = int(args.mixup_ramp_start)
+    mixup_ramp_end = int(args.mixup_ramp_end)
     base_mosaic = float(train_ds.mosaic_prob)
     base_mixup = float(train_ds.mixup_prob)
     base_scale = float(train_ds.scale)
     target_mosaic = 0.8
-    target_mixup = 0.1
+    target_mixup = float(args.mixup_target_prob)
     target_scale = 0.5
     for epoch in range(1, args.epochs+1):
         # ---- Staged augmentation schedule ----
         if not mosaic_closed:
             if epoch <= ramp_start:
                 train_ds.mosaic_prob = base_mosaic
-                train_ds.mixup_prob = base_mixup
                 train_ds.scale = base_scale
+                train_ds.mixup_prob = base_mixup
             elif epoch <= ramp_end:
                 t = (epoch - ramp_start) / max((ramp_end - ramp_start), 1)
                 train_ds.mosaic_prob = base_mosaic + t * (target_mosaic - base_mosaic)
-                train_ds.mixup_prob = base_mixup + t * (target_mixup - base_mixup)
                 train_ds.scale = base_scale + t * (target_scale - base_scale)
+                if epoch <= mixup_ramp_start:
+                    train_ds.mixup_prob = base_mixup
+                elif epoch <= mixup_ramp_end:
+                    tm = (epoch - mixup_ramp_start) / max((mixup_ramp_end - mixup_ramp_start), 1)
+                    train_ds.mixup_prob = base_mixup + tm * (target_mixup - base_mixup)
+                else:
+                    train_ds.mixup_prob = target_mixup
             else:
                 train_ds.mosaic_prob = target_mosaic
-                train_ds.mixup_prob = target_mixup
                 train_ds.scale = target_scale
+                if epoch <= mixup_ramp_start:
+                    train_ds.mixup_prob = base_mixup
+                elif epoch <= mixup_ramp_end:
+                    tm = (epoch - mixup_ramp_start) / max((mixup_ramp_end - mixup_ramp_start), 1)
+                    train_ds.mixup_prob = base_mixup + tm * (target_mixup - base_mixup)
+                else:
+                    train_ds.mixup_prob = target_mixup
 
         # YOLOv8-style: disable mosaic/mixup in the last N epochs
         if (not mosaic_closed) and getattr(args, "close_mosaic", 0) and epoch >= (args.epochs - int(args.close_mosaic) + 1):
@@ -2024,13 +2051,21 @@ def train(args):
             irs  = irs.to(device,  non_blocking=True if device.type=='cuda' else False)
             tgts = [{k:v.to(device) if torch.is_tensor(v) else v for k,v in t.items()} for t in targets]
 
-            preds = model(rgbs, irs)
-            loss, parts = criterion(preds, tgts, raw_model.strides)
-
             optim.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-            optim.step()
+            with torch.amp.autocast(device_type=amp_device, enabled=amp_enabled):
+                preds = model(rgbs, irs)
+                loss, parts = criterion(preds, tgts, raw_model.strides)
+
+            if amp_enabled:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optim)
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                scaler.step(optim)
+                scaler.update()
+            else:
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                optim.step()
             if ema is not None:
                 ema.update(unwrap_model(model))
 
@@ -2153,7 +2188,7 @@ def get_args():
     ap.add_argument("--lr",        type=float, default=None, help="兼容旧参数：等价于 --lr0")
     ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
-    ap.add_argument("--logdir",    type=str, default="./runs/0204_stage")
+    ap.add_argument("--logdir",    type=str, default="./runs/0228_amp")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
     ap.add_argument("--gpus",      type=str, default="", help="单进程多 GPU（DataParallel），例如：--gpus 0,1,2。推荐优先用 DDP(torchrun)。")
@@ -2162,6 +2197,11 @@ def get_args():
     ap.add_argument("--close_mosaic",  type=int, default=20, help="训练最后 N 个 epoch 关闭 mosaic/mixup（YOLOv8 默认 close_mosaic=10）")
     ap.add_argument("--mosaic_prob",   type=float, default=0.6, help="mosaic 概率（训练集）")
     ap.add_argument("--mixup_prob",    type=float, default=0.0, help="mixup 概率（训练集，仅在 mosaic 分支生效）")
+    ap.add_argument("--mixup_target_prob", type=float, default=0.04, help="增强爬升阶段的目标 mixup 概率")
+    ap.add_argument("--mixup_ramp_start", type=int, default=40, help="mixup 增强爬升起始 epoch")
+    ap.add_argument("--mixup_ramp_end", type=int, default=100, help="mixup 增强爬升结束 epoch")
+    ap.add_argument("--amp", action="store_true", default=True, help="启用 AMP 混合精度训练（默认开启）")
+    ap.add_argument("--no-amp", dest="amp", action="store_false", help="关闭 AMP 混合精度训练")
     ap.add_argument("--auto_batch", action="store_true", help="自动估算批大小以尽量占满显存")
     ap.add_argument("--max_vram_frac", type=float, default=0.9, help="自动批大小的目标显存占用比例 (0-1)")
     args = ap.parse_args()
