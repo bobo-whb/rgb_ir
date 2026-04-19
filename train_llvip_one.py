@@ -564,7 +564,7 @@ class RGBIRDetDataset(Dataset):
         return rgb, ir, boxes
 
     def _apply_hsv(self, rgb, ir):
-        """Apply HSV jittering only on the RGB modality."""
+        """Apply the same HSV augmentation to RGB and IR (baseline recipe)."""
         if not self.hsv_gain:
             return rgb, ir
         hgain, sgain, vgain = self.hsv_gain
@@ -572,15 +572,14 @@ class RGBIRDetDataset(Dataset):
             return rgb, ir
         gains = np.random.uniform(-1, 1, 3) * np.array([hgain, sgain, vgain]) + 1.0
 
-        def _adjust(img):
+        def _adjust(img: np.ndarray) -> np.ndarray:
             hsv = cv2.cvtColor(img, cv2.COLOR_RGB2HSV).astype(np.float32)
             hsv[..., 0] = (hsv[..., 0] * gains[0]) % 180.0
             hsv[..., 1] = np.clip(hsv[..., 1] * gains[1], 0, 255)
             hsv[..., 2] = np.clip(hsv[..., 2] * gains[2], 0, 255)
             return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
 
-        # Only perturb RGB while keeping IR untouched.
-        return _adjust(rgb), ir
+        return _adjust(rgb), _adjust(ir)
 
     def _spectral_augment(self, rgb, ir):
         """Perform spectral mixing on RGB only, leaving IR as-is."""
@@ -1003,22 +1002,26 @@ class YoloV8NeckSingle(nn.Module):
     
 class XAttnGate(nn.Module):
     """
-    稳定版跨模态门控（按用户定义的结构）：
+    轻量版跨模态门控（方案 A：Bottleneck + Depthwise）：
       1) 由 r,i,c 生成 [r, i, c, i-r] 在通道维拼接 -> (B, 4C, H, W)
-      2) 3x3 Conv + BN + SiLU
-      3) 1x1 Conv 将 4C 映射到 3C（零初始化）
+      2) 1x1 Conv 降维到 hidden
+      3) 3x3 Depthwise Conv + BN + SiLU
+      4) 1x1 Conv 将 hidden 映射到 3C（零初始化）
       4) reshape 为 (B, 3, C, H, W) 后做 softmax（带温度）
     """
-    def __init__(self, channels: int, temperature: float = 2.0):
+    def __init__(self, channels: int, temperature: float = 2.0, reduction: int = 4, min_hidden: int = 32):
         super().__init__()
         self.channels = channels
         self.temperature = float(temperature)
-        self.conv3 = nn.Conv2d(4 * channels, 4 * channels, kernel_size=3, padding=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(4 * channels)
-        self.act = nn.SiLU(inplace=True)
-        self.conv1 = nn.Conv2d(4 * channels, 3 * channels, kernel_size=1, padding=0, bias=True)
-        nn.init.zeros_(self.conv1.weight)
-        nn.init.zeros_(self.conv1.bias)
+        self.reduction = max(int(reduction), 1)
+        hidden = max(channels // self.reduction, int(min_hidden))
+        self.hidden = hidden
+
+        self.reduce = ConvBNAct(4 * channels, hidden, 1, 1)
+        self.dw = ConvBNAct(hidden, hidden, 3, 1, g=hidden)
+        self.expand = nn.Conv2d(hidden, 3 * channels, kernel_size=1, padding=0, bias=True)
+        nn.init.zeros_(self.expand.weight)
+        nn.init.zeros_(self.expand.bias)
 
     def forward(self, r: torch.Tensor, i: torch.Tensor, c: torch.Tensor):
         """
@@ -1028,8 +1031,9 @@ class XAttnGate(nn.Module):
         """
         B, C, H, W = r.shape
         feat = torch.cat([r, i, c, i - r], dim=1)  # (B, 4C, H, W)
-        x = self.act(self.bn3(self.conv3(feat)))
-        x = self.conv1(x)  # (B, 3C, H, W)
+        x = self.reduce(feat)
+        x = self.dw(x)
+        x = self.expand(x)  # (B, 3C, H, W)
         x = x.view(B, 3, C, H, W)
         x = x / max(self.temperature, 1e-6)
         x = torch.softmax(x, dim=1)
@@ -1852,7 +1856,12 @@ def train(args):
     val_ds   = RGBIRDetDataset(args.val_csv,   imgsz=args.imgsz, augment=False)
 
     # Model
-    model = DualYoloV8L(num_classes=len(CANONICAL_CLASSES), imgsz=args.imgsz).to(device)
+    model = DualYoloV8L(num_classes=len(CANONICAL_CLASSES), imgsz=args.imgsz)
+    if distributed and device.type == "cuda" and getattr(args, "sync_bn", True):
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        if is_main_process():
+            logger.info("Converted BatchNorm layers to SyncBatchNorm for DDP.")
+    model = model.to(device)
     optim = build_optimizer(model, args)
     criterion = YoloLoss(len(CANONICAL_CLASSES), reg_max=16)
     ema = ModelEMA(model, decay=args.ema_decay, tau=args.ema_tau) if args.ema else None
@@ -1876,7 +1885,8 @@ def train(args):
             logger.info(f"Auto batch | free={free_mem/1024**3:.2f} GiB total={total_mem/1024**3:.2f} GiB, target frac={args.max_vram_frac}")
 
             sample_rgb, sample_ir, sample_tgt, _ = train_ds[0]
-            base_b = max(1, min(args.batch, 4))
+            target_batch_for_probe = max(1, (args.batch // world_size) if distributed else args.batch)
+            base_b = max(1, min(target_batch_for_probe, 4))
             rgb_b = sample_rgb.unsqueeze(0).repeat(base_b, 1, 1, 1).to(device)
             ir_b  = sample_ir.unsqueeze(0).repeat(base_b, 1, 1, 1).to(device)
             tgt_b = []
@@ -1901,25 +1911,43 @@ def train(args):
             target_mem = total_mem * args.max_vram_frac
             est_batch = int(target_mem // max(mem_per_sample, 1))
             est_batch = max(1, est_batch)
-            est_batch = min(est_batch, args.batch * 3)  # 避免倍数过大
-            logger.info(f"Auto batch | peak={peak/1024**3:.2f} GiB for {base_b} -> {mem_per_sample/1024**3:.3f} GiB/sample, suggested batch={est_batch}")
-            args.batch = est_batch
+            est_batch = min(est_batch, target_batch_for_probe * 3)  # 避免倍数过大
+            if distributed:
+                logger.info(
+                    f"Auto batch | peak={peak/1024**3:.2f} GiB for local batch {base_b} "
+                    f"-> {mem_per_sample/1024**3:.3f} GiB/sample, suggested local batch={est_batch}, "
+                    f"global batch={est_batch * world_size}"
+                )
+                args.batch = est_batch * world_size
+            else:
+                logger.info(f"Auto batch | peak={peak/1024**3:.2f} GiB for {base_b} -> {mem_per_sample/1024**3:.3f} GiB/sample, suggested batch={est_batch}")
+                args.batch = est_batch
         except Exception as e:
             logger.warning(f"Auto batch failed: {e}. 使用用户设定 batch={args.batch}")
             torch.cuda.empty_cache()
 
-    # DDP 下把 batch 同步到所有进程（global batch = args.batch * world_size）
+    # DDP 下将 --batch 视为 global batch，并均分到各进程，保持与单进程/DP 语义一致。
     if distributed:
         b = torch.tensor([int(args.batch)], device=device, dtype=torch.int64)
         dist.broadcast(b, src=0)
         args.batch = int(b.item())
+        if args.batch < world_size:
+            raise ValueError(f"DDP 模式下 --batch({args.batch}) 必须 >= world_size({world_size})。")
+        if args.batch % world_size != 0:
+            raise ValueError(
+                f"DDP 模式下 --batch({args.batch}) 必须能被 world_size({world_size}) 整除，"
+                "以保持 global batch 语义不变。"
+            )
+        batch_size_per_rank = args.batch // world_size
+    else:
+        batch_size_per_rank = args.batch
 
     # DataLoaders (放到 auto-batch 之后，确保 batch_size 生效)
     if distributed:
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)
         train_loader = DataLoader(
             train_ds,
-            batch_size=args.batch,
+            batch_size=batch_size_per_rank,
             shuffle=False,
             sampler=train_sampler,
             num_workers=args.num_workers,
@@ -1927,18 +1955,21 @@ def train(args):
             pin_memory=True if device.type == "cuda" else False,
         )
         # val_loader 仅 rank0 用于评估：不使用 DistributedSampler，避免只评估子集
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=args.batch,
-            shuffle=False,
-            num_workers=args.num_workers,
-            collate_fn=collate_fn,
-            pin_memory=True if device.type == "cuda" else False,
-        )
+        if is_main_process():
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=batch_size_per_rank,
+                shuffle=False,
+                num_workers=args.num_workers,
+                collate_fn=collate_fn,
+                pin_memory=True if device.type == "cuda" else False,
+            )
+        else:
+            val_loader = None
     else:
         train_loader = DataLoader(
             train_ds,
-            batch_size=args.batch,
+            batch_size=batch_size_per_rank,
             shuffle=True,
             num_workers=args.num_workers,
             collate_fn=collate_fn,
@@ -1946,7 +1977,7 @@ def train(args):
         )
         val_loader = DataLoader(
             val_ds,
-            batch_size=args.batch,
+            batch_size=batch_size_per_rank,
             shuffle=False,
             num_workers=args.num_workers,
             collate_fn=collate_fn,
@@ -1955,7 +1986,12 @@ def train(args):
 
     # Wrap model for multi-GPU
     if distributed:
-        model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
+        model = DDP(
+            model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+            output_device=device.index if device.type == "cuda" else None,
+            find_unused_parameters=False,
+        )
     else:
         gpus = parse_gpus_arg(getattr(args, "gpus", ""))
         if device.type == "cuda" and len(gpus) > 1:
@@ -1968,11 +2004,15 @@ def train(args):
             f"Recipe | opt={args.optimizer} lr0={args.lr0} lrf={args.lrf} "
             f"momentum={args.momentum} wd={args.weight_decay} "
             f"warmup_epochs={args.warmup_epochs} warmup_iters={warmup_iters} "
-            f"ema={'on' if ema else 'off'} amp={'on' if amp_enabled else 'off'}"
+            f"ema={'on' if ema else 'off'} amp={'on' if amp_enabled else 'off'} "
+            f"second_stage_ft={'on' if args.second_stage_ft else 'off'} "
+            f"batch_global={args.batch} batch_per_rank={batch_size_per_rank} "
+            f"sync_bn={'on' if (distributed and device.type == 'cuda' and getattr(args, 'sync_bn', True)) else 'off'}"
         )
 
     best_map = 0.0
     mosaic_closed = False
+    finetune_started = False
     # ---- Staged augmentation schedule ----
     # Keep first 40 epochs unchanged, then ramp up augmentation from epoch 41 to 120.
     ramp_start = 40
@@ -1982,20 +2022,60 @@ def train(args):
     base_mosaic = float(train_ds.mosaic_prob)
     base_mixup = float(train_ds.mixup_prob)
     base_scale = float(train_ds.scale)
+    base_translate = float(train_ds.translate)
+    base_degrees = float(train_ds.degrees)
+    base_shear = float(train_ds.shear)
+    base_perspective = float(train_ds.perspective)
+    base_hsv_gain = tuple(train_ds.hsv_gain)
+    base_spectral_prob = float(train_ds.spectral_prob)
     target_mosaic = 0.8
     target_mixup = float(args.mixup_target_prob)
     target_scale = 0.5
+    ft_epochs = max(0, int(getattr(args, "ft_epochs", 0)))
+    ft_start_epoch = max(1, args.epochs - ft_epochs + 1) if bool(getattr(args, "second_stage_ft", False)) and ft_epochs > 0 else None
     for epoch in range(1, args.epochs+1):
+        ft_active = ft_start_epoch is not None and epoch >= ft_start_epoch
         # ---- Staged augmentation schedule ----
-        if not mosaic_closed:
+        if ft_active:
+            train_ds.mosaic = False
+            train_ds.mosaic_prob = 0.0
+            train_ds.mixup_prob = 0.0
+            train_ds.scale = float(args.ft_scale)
+            train_ds.translate = float(args.ft_translate)
+            train_ds.degrees = 0.0
+            train_ds.shear = 0.0
+            train_ds.perspective = 0.0
+            train_ds.hsv_gain = (0.0, 0.0, 0.0)
+            train_ds.spectral_prob = 0.0
+            mosaic_closed = True
+            if (not finetune_started) and ((not distributed) or is_main_process()):
+                logger.info(
+                    f"Second-stage fine-tune enabled for last {ft_epochs} epochs "
+                    f"(epoch {epoch} -> {args.epochs}) | lr_scale={args.ft_lr_scale} "
+                    f"scale={args.ft_scale} translate={args.ft_translate} hsv=off"
+                )
+            finetune_started = True
+        elif not mosaic_closed:
             if epoch <= ramp_start:
                 train_ds.mosaic_prob = base_mosaic
                 train_ds.scale = base_scale
                 train_ds.mixup_prob = base_mixup
+                train_ds.translate = base_translate
+                train_ds.degrees = base_degrees
+                train_ds.shear = base_shear
+                train_ds.perspective = base_perspective
+                train_ds.hsv_gain = base_hsv_gain
+                train_ds.spectral_prob = base_spectral_prob
             elif epoch <= ramp_end:
                 t = (epoch - ramp_start) / max((ramp_end - ramp_start), 1)
                 train_ds.mosaic_prob = base_mosaic + t * (target_mosaic - base_mosaic)
                 train_ds.scale = base_scale + t * (target_scale - base_scale)
+                train_ds.translate = base_translate
+                train_ds.degrees = base_degrees
+                train_ds.shear = base_shear
+                train_ds.perspective = base_perspective
+                train_ds.hsv_gain = base_hsv_gain
+                train_ds.spectral_prob = base_spectral_prob
                 if epoch <= mixup_ramp_start:
                     train_ds.mixup_prob = base_mixup
                 elif epoch <= mixup_ramp_end:
@@ -2006,6 +2086,12 @@ def train(args):
             else:
                 train_ds.mosaic_prob = target_mosaic
                 train_ds.scale = target_scale
+                train_ds.translate = base_translate
+                train_ds.degrees = base_degrees
+                train_ds.shear = base_shear
+                train_ds.perspective = base_perspective
+                train_ds.hsv_gain = base_hsv_gain
+                train_ds.spectral_prob = base_spectral_prob
                 if epoch <= mixup_ramp_start:
                     train_ds.mixup_prob = base_mixup
                 elif epoch <= mixup_ramp_end:
@@ -2015,7 +2101,7 @@ def train(args):
                     train_ds.mixup_prob = target_mixup
 
         # YOLOv8-style: disable mosaic/mixup in the last N epochs
-        if (not mosaic_closed) and getattr(args, "close_mosaic", 0) and epoch >= (args.epochs - int(args.close_mosaic) + 1):
+        if (not ft_active) and (not mosaic_closed) and getattr(args, "close_mosaic", 0) and epoch >= (args.epochs - int(args.close_mosaic) + 1):
             train_ds.mosaic = False
             train_ds.mixup_prob = 0.0
             mosaic_closed = True
@@ -2044,6 +2130,8 @@ def train(args):
             else:
                 progress = (epoch - 1 + i / max(nb, 1)) / max(args.epochs, 1)
                 lr = args.lr0 * cosine_lr_factor(progress, args.lrf)
+                if ft_active:
+                    lr *= float(args.ft_lr_scale)
                 for pg in optim.param_groups:
                     pg["lr"] = lr
 
@@ -2170,7 +2258,7 @@ def get_args():
     ap.add_argument("--val_csv",   type=str, default="../LLVIP/llvip_test_paths.csv")
     ap.add_argument("--imgsz",     type=int, default=640)
     ap.add_argument("--epochs",    type=int, default=220)
-    ap.add_argument("--batch",     type=int, default=20)
+    ap.add_argument("--batch",     type=int, default=20, help="global batch size；DDP 下会自动均分到各 rank")
     ap.add_argument("--num_workers", type=int, default=4)
     # ---- YOLOv8-like recipe ----
     ap.add_argument("--lr0",       type=float, default=0.01, help="初始学习率 (YOLOv8 默认 0.01)")
@@ -2188,11 +2276,13 @@ def get_args():
     ap.add_argument("--lr",        type=float, default=None, help="兼容旧参数：等价于 --lr0")
     ap.add_argument("--conf_thres",type=float, default=0.001)
     ap.add_argument("--nms_iou",   type=float, default=0.5)
-    ap.add_argument("--logdir",    type=str, default="./runs/0228_amp")
+    ap.add_argument("--logdir",    type=str, default="./runs/0419")
     ap.add_argument("--seed",      type=int, default=42)
     ap.add_argument("--gpu",       type=int, default=0, help="使用第几张 GPU（0 开始）。设为 -1 强制使用 CPU。")
     ap.add_argument("--gpus",      type=str, default="", help="单进程多 GPU（DataParallel），例如：--gpus 0,1,2。推荐优先用 DDP(torchrun)。")
     ap.add_argument("--local_rank", type=int, default=-1, help=argparse.SUPPRESS)
+    ap.add_argument("--sync_bn", action="store_true", default=True, help="DDP 下启用 SyncBatchNorm（默认开启）")
+    ap.add_argument("--no-sync-bn", dest="sync_bn", action="store_false", help="关闭 DDP 下的 SyncBatchNorm")
     ap.add_argument("--max_det",       type=int, default=300)
     ap.add_argument("--close_mosaic",  type=int, default=20, help="训练最后 N 个 epoch 关闭 mosaic/mixup（YOLOv8 默认 close_mosaic=10）")
     ap.add_argument("--mosaic_prob",   type=float, default=0.6, help="mosaic 概率（训练集）")
@@ -2200,6 +2290,11 @@ def get_args():
     ap.add_argument("--mixup_target_prob", type=float, default=0.04, help="增强爬升阶段的目标 mixup 概率")
     ap.add_argument("--mixup_ramp_start", type=int, default=40, help="mixup 增强爬升起始 epoch")
     ap.add_argument("--mixup_ramp_end", type=int, default=100, help="mixup 增强爬升结束 epoch")
+    ap.add_argument("--second_stage_ft", action="store_true", help="启用第二阶段 fine-tune：最后若干 epoch 关闭 HSV/强增强并降低学习率")
+    ap.add_argument("--ft_epochs", type=int, default=20, help="second-stage fine-tune 持续的 epoch 数（默认最后 20 epoch）")
+    ap.add_argument("--ft_lr_scale", type=float, default=0.1, help="second-stage fine-tune 的学习率缩放倍数")
+    ap.add_argument("--ft_scale", type=float, default=0.1, help="second-stage fine-tune 时保留的缩放增强幅度")
+    ap.add_argument("--ft_translate", type=float, default=0.02, help="second-stage fine-tune 时保留的平移增强幅度")
     ap.add_argument("--amp", action="store_true", default=True, help="启用 AMP 混合精度训练（默认开启）")
     ap.add_argument("--no-amp", dest="amp", action="store_false", help="关闭 AMP 混合精度训练")
     ap.add_argument("--auto_batch", action="store_true", help="自动估算批大小以尽量占满显存")
